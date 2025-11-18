@@ -1,0 +1,12 @@
+LIBRARY gcapture
+EXPORTS
+    gcap_enumerate
+    gcap_open
+    gcap_set_profile
+    gcap_set_buffers
+    gcap_set_callbacks
+    gcap_start
+    gcap_stop
+    gcap_close
+    gcap_strerror
+    gcap__marker_export
