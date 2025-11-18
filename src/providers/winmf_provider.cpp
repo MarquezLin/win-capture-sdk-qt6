@@ -127,6 +127,16 @@ bool WinMFProvider::create_reader_cpu_only(int devIndex)
     }
     hr = pp[devIndex]->ActivateObject(__uuidof(IMFMediaSource),
                                       (void **)source_.ReleaseAndGetAddressOf());
+
+    // 讀 FriendlyName 存到 dev_name_
+    WCHAR *wname = nullptr;
+    UINT32 cch = 0;
+    if (SUCCEEDED(pp[devIndex]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &wname, &cch)))
+    {
+        dev_name_ = utf8_from_wide(wname);
+        CoTaskMemFree(wname);
+    }
+
     for (UINT32 i = 0; i < count; ++i)
         pp[i]->Release();
     CoTaskMemFree(pp);
@@ -970,6 +980,24 @@ void WinMFProvider::loop()
             continue;
         }
 
+        // 每一筆 sample 都會有 ts (100ns 單位)；我們前面用 f.pts_ns = ts * 100
+        double fps_now = 0.0;
+        if (last_pts_ns_ != 0)
+        {
+            uint64_t delta = ((uint64_t)ts * 100) - last_pts_ns_; // ns
+            if (delta > 0)
+                fps_now = 1e9 / (double)delta;
+        }
+        // 簡單一階濾波
+        if (fps_now > 0.0)
+        {
+            if (fps_avg_ <= 0.0)
+                fps_avg_ = fps_now;
+            else
+                fps_avg_ = fps_avg_ * 0.9 + fps_now * 0.1;
+        }
+        last_pts_ns_ = (uint64_t)ts * 100;
+
         ComPtr<IMFMediaBuffer> buf;
         if (FAILED(sample->ConvertToContiguousBuffer(&buf)))
             continue;
@@ -999,11 +1027,24 @@ void WinMFProvider::loop()
             }
         }
 
+        const wchar_t *fmtName =
+            (cur_subtype_ == MFVideoFormat_P010)     ? L"P010"
+            : (cur_subtype_ == MFVideoFormat_NV12)   ? L"NV12"
+            : (cur_subtype_ == MFVideoFormat_ARGB32) ? L"ARGB32"
+                                                     : L"?";
+
+        const wchar_t *bitDepth =
+            (cur_subtype_ == MFVideoFormat_P010) ? L"10-bit"
+                                                 : L"8-bit"; // NV12 / ARGB32 皆 8-bit
+
+        double fps_show = fps_avg_ > 0.0 ? fps_avg_ : 0.0;
+
         wchar_t line[512];
-        swprintf(line, 512, L"%s | %dx%d | %s | #%llu",
+        swprintf(line, 512, L"%s | %dx%d @ %.2f fps | %s %s | #%llu",
                  (wdev[0] ? wdev : L"Device"),
                  cur_w_, cur_h_,
-                 (cur_subtype_ == MFVideoFormat_P010 ? L"P010" : L"NV12"),
+                 fps_show,
+                 fmtName, bitDepth,
                  (unsigned long long)frame_id_);
         gpu_overlay_text(line);
 

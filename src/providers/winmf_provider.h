@@ -64,6 +64,8 @@ private:
     std::thread th_;
     uint64_t frame_id_ = 0;
     std::string dev_name_; // 目前選用的裝置名稱（UTF-8）
+    double fps_avg_ = 0.0;
+    uint64_t last_pts_ns_ = 0;
 
     // ---- MF objects ----
     ComPtr<IMFMediaSource> source_;
