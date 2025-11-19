@@ -5,16 +5,20 @@
 #include "../providers/winmf_provider.h"
 #endif
 
+#ifdef GCAP_WIN_DSHOW
+#include "../providers/dshow_provider.h"
+#endif
+
 /**
  * @brief Constructor — selects platform-specific provider.
  */
 CaptureManager::CaptureManager()
 {
-#ifdef GCAP_WIN_MF
-    // Use Media Foundation provider on Windows
+#ifdef GCAP_WIN_DSHOW
+    provider_ = std::make_unique<DShowProvider>();
+#elif defined(GCAP_WIN_MF)
     provider_ = std::make_unique<WinMFProvider>();
 #else
-    // Unsupported on this platform (no provider defined)
     provider_ = nullptr;
 #endif
 }

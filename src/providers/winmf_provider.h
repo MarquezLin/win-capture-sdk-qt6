@@ -53,6 +53,8 @@ public:
     // Set callback functions for video frames and errors
     void setCallbacks(gcap_on_video_cb vcb, gcap_on_error_cb ecb, void *user) override;
 
+    bool isUsingGpu() const { return use_dxgi_ && !cpu_path_; }
+
 private:
     // ---- Callbacks ----
     gcap_on_video_cb vcb_ = nullptr;
@@ -66,6 +68,8 @@ private:
     std::string dev_name_; // 目前選用的裝置名稱（UTF-8）
     double fps_avg_ = 0.0;
     uint64_t last_pts_ns_ = 0;
+    bool use_dxgi_ = false;
+    bool cpu_path_ = true;
 
     // ---- MF objects ----
     ComPtr<IMFMediaSource> source_;
@@ -132,9 +136,6 @@ private:
 
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>
     createSRV_P010(ID3D11Device *dev, ID3D11Texture2D *tex, bool uv);
-
-    bool use_dxgi_ = false;
-    bool cpu_path_ = true;
 
     bool create_reader_cpu_only(int devIndex);
 

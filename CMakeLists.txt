@@ -9,6 +9,7 @@ add_library(gcapture SHARED
     src/core/frame_converter.cpp
     src/core/c_api.cpp            # C API 包裝，務必有這行
     src/providers/winmf_provider.cpp
+    src/providers/dshow_provider.cpp 
     src/core/exports.def
 )
 
@@ -16,7 +17,8 @@ target_include_directories(gcapture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Windows / Media Foundation
 if (WIN32)
-  target_compile_definitions(gcapture PRIVATE -DGCAP_WIN_MF)
+  # target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF GCAP_WIN_DSHOW)
+  target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF)
   target_compile_definitions(gcapture PRIVATE GCAPTURE_BUILD)
 
   # ★ 把常見會漏的系統庫一次補齊
@@ -28,6 +30,7 @@ if (WIN32)
       user32 advapi32                   # 低機率需要，但安全
       dxgi d3d11 d2d1 dwrite            # Direct3D
       D3DCompiler                       # Direct3D
+      strmiids                          # DirectShow IIDs
   )
 
   # 檔案含中文/UTF-8

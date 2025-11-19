@@ -170,11 +170,31 @@ bool WinMFProvider::open(int index)
 {
     ensure_mf();
 
-    // 保險模式：強制 CPU 路徑，不建立任何 D3D/D2D
+    // 先試 GPU + DXGI 管線
+    if (create_d3d() && create_reader_with_dxgi(index) && use_dxgi_)
+    {
+        GUID sub = GUID_NULL;
+        UINT w = 0, h = 0, fn = 0, fd = 1;
+        if (pick_best_native(sub, w, h, fn, fd) && ensure_rt_and_pipeline((int)w, (int)h))
+        {
+            cur_subtype_ = sub;
+            cur_w_ = (int)w;
+            cur_h_ = (int)h;
+            cpu_path_ = false; // 讓 loop() 走 GPU 分支
+            OutputDebugStringA("[WinMF] open(): using DXGI/GPU pipeline\n");
+            return true;
+        }
+
+        OutputDebugStringA("[WinMF] open(): DXGI path failed after pick_best_native/ensure_rt, fallback to CPU\n");
+    }
+
+    // ---- CPU fallback ----
+    reader_.Reset();
+    source_.Reset();
     use_dxgi_ = false;
     cpu_path_ = true;
 
-    // 只建立最寬鬆的 reader（不帶任何屬性），保證可建
+    // 只建立 CPU + Video Processing 的 reader
     if (!create_reader_cpu_only(index))
     {
         emit_error(GCAP_EIO, "Create reader (CPU) failed");
@@ -182,7 +202,7 @@ bool WinMFProvider::open(int index)
         return false;
     }
 
-    // 先嘗試 NV12
+    // 先嘗試把輸出設成 NV12，不行再 ARGB32
     {
         ComPtr<IMFMediaType> mt;
         MFCreateMediaType(&mt);
@@ -192,7 +212,6 @@ bool WinMFProvider::open(int index)
         if (FAILED(hr))
         {
             DBG("SetCurrentMediaType(NV12)", hr);
-            // NV12 不行再試 ARGB32
             ComPtr<IMFMediaType> mt2;
             MFCreateMediaType(&mt2);
             mt2->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -201,18 +220,19 @@ bool WinMFProvider::open(int index)
             if (FAILED(hr))
             {
                 DBG("SetCurrentMediaType(ARGB32)", hr);
-                // 兩個都失敗就不再硬設，直接讀回目前的實際型態
+                // 兩個都失敗就不硬設，直接用裝置預設型態
             }
         }
     }
 
-    // 讀回實際談好的型態
+    // 讀回實際型態，更新 cur_* 給 CPU 路使用
     ComPtr<IMFMediaType> cur;
     if (FAILED(reader_->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)))
     {
         emit_error(GCAP_EIO, "GetCurrentMediaType failed");
         return false;
     }
+
     UINT32 w = 0, h = 0, fn = 0, fd = 1;
     MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &w, &h);
     MFGetAttributeRatio(cur.Get(), MF_MT_FRAME_RATE, &fn, &fd);
@@ -226,6 +246,8 @@ bool WinMFProvider::open(int index)
     // 只開第一個視訊串流
     reader_->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
     reader_->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+
+    OutputDebugStringA("[WinMF] open(): using CPU pipeline\n");
     return true;
 }
 
@@ -354,6 +376,9 @@ bool WinMFProvider::create_d3d()
 
 bool WinMFProvider::create_reader_with_dxgi(int devIndex)
 {
+    use_dxgi_ = false; // 預設關掉 DXGI
+    cpu_path_ = true;
+
     auto activate_source = [&](ComPtr<IMFMediaSource> &out) -> HRESULT
     {
         out.Reset();
@@ -366,17 +391,20 @@ bool WinMFProvider::create_reader_with_dxgi(int devIndex)
         IMFActivate **pp = nullptr;
         UINT32 count = 0;
         hr = MFEnumDeviceSources(attr.Get(), &pp, &count);
-        if (FAILED(hr))
-            return hr;
-        if ((UINT32)devIndex >= count)
+        if (FAILED(hr) || (UINT32)devIndex >= count)
         {
-            for (UINT32 i = 0; i < count; ++i)
-                pp[i]->Release();
-            CoTaskMemFree(pp);
-            return E_INVALIDARG;
+            if (pp)
+            {
+                for (UINT32 i = 0; i < count; ++i)
+                    pp[i]->Release();
+                CoTaskMemFree(pp);
+            }
+            return FAILED(hr) ? hr : E_INVALIDARG;
         }
+
         hr = pp[devIndex]->ActivateObject(__uuidof(IMFMediaSource),
-                                          (void **)out.ReleaseAndGetAddressOf());
+                                          reinterpret_cast<void **>(out.GetAddressOf()));
+
         for (UINT32 i = 0; i < count; ++i)
             pp[i]->Release();
         CoTaskMemFree(pp);
@@ -385,97 +413,40 @@ bool WinMFProvider::create_reader_with_dxgi(int devIndex)
 
     HRESULT hr = S_OK;
 
-    // Try #1: DXGI + VP + HW
-    if (dxgi_mgr_)
-    {
-        hr = activate_source(source_);
-        if (SUCCEEDED(hr))
-        {
-            ComPtr<IMFAttributes> rdAttr;
-            hr = MFCreateAttributes(&rdAttr, 3);
-            if (SUCCEEDED(hr))
-            {
-                rdAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-                rdAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-                rdAttr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, dxgi_mgr_.Get());
-                hr = MFCreateSourceReaderFromMediaSource(source_.Get(), rdAttr.Get(), &reader_);
-            }
-            if (SUCCEEDED(hr))
-            {
-                use_dxgi_ = true;
-                cpu_path_ = false;
-                return true;
-            }
-            else
-            {
-                DBG("CreateReader DXGI+VP+HW", hr);
-                if (source_)
-                    source_->Shutdown(); // 這顆已經不乾淨，丟掉
-                source_.Reset();
-                reader_.Reset();
-            }
-        }
-        else
-        {
-            DBG("ActivateObject(IMFMediaSource)", hr);
-        }
-    }
-
-    // Try #2: VP only（無 DXGI）
+    DBG("DXGI: Try DXGI+VP - begin", S_OK);
     hr = activate_source(source_);
-    if (SUCCEEDED(hr))
+    if (FAILED(hr))
     {
-        ComPtr<IMFAttributes> rdAttr;
-        hr = MFCreateAttributes(&rdAttr, 1);
-        if (SUCCEEDED(hr))
-        {
-            rdAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-            hr = MFCreateSourceReaderFromMediaSource(source_.Get(), rdAttr.Get(), &reader_);
-        }
-        if (SUCCEEDED(hr))
-        {
-            use_dxgi_ = false; // 無 DXGI
-            return true;
-        }
-        else
-        {
-            DBG("CreateReader VP-only", hr);
-            if (source_)
-                source_->Shutdown();
-            source_.Reset();
-            reader_.Reset();
-        }
-    }
-    else
-    {
-        DBG("ActivateObject(IMFMediaSource)", hr);
+        DBG("DXGI: activate_source failed", hr);
+        return false;
     }
 
-    // Try #3: bare（最寬鬆，不帶任何屬性）
-    hr = activate_source(source_);
-    if (SUCCEEDED(hr))
+    ComPtr<IMFAttributes> rdAttr;
+    hr = MFCreateAttributes(&rdAttr, 3);
+    if (FAILED(hr))
     {
-        hr = MFCreateSourceReaderFromMediaSource(source_.Get(), nullptr, &reader_);
-        if (SUCCEEDED(hr))
-        {
-            use_dxgi_ = false;
-            return true;
-        }
-        else
-        {
-            DBG("CreateReader bare", hr);
-            if (source_)
-                source_->Shutdown();
-            source_.Reset();
-            reader_.Reset();
-        }
-    }
-    else
-    {
-        DBG("ActivateObject(IMFMediaSource)", hr);
+        DBG("DXGI: MFCreateAttributes(reader) failed", hr);
+        return false;
     }
 
-    return false;
+    rdAttr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, dxgi_mgr_.Get());
+    rdAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    rdAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+
+    hr = MFCreateSourceReaderFromMediaSource(source_.Get(), rdAttr.Get(), &reader_);
+    if (FAILED(hr))
+    {
+        DBG("DXGI: MFCreateSourceReaderFromMediaSource failed", hr);
+        // DXGI 完全不支援，讓 open() 去走 CPU fallback
+        reader_.Reset();
+        source_.Reset();
+        return false;
+    }
+
+    use_dxgi_ = true;
+    cpu_path_ = false;
+    DBG("DXGI: DXGI+VP SUCCESS", hr);
+    return true;
 }
 
 bool WinMFProvider::pick_best_native(GUID &sub, UINT32 &w, UINT32 &h, UINT32 &fn, UINT32 &fd)
