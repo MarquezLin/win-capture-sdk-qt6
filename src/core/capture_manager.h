@@ -91,6 +91,8 @@ public:
     gcap_status_t stop();
     gcap_status_t close();
 
+    static void setBackendInt(int v);
+
 private:
     std::unique_ptr<ICaptureProvider> provider_; // Active provider instance
     gcap_on_video_cb vcb_ = nullptr;             // Video frame callback

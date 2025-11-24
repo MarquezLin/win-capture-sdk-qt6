@@ -9,18 +9,32 @@
 #include "../providers/dshow_provider.h"
 #endif
 
+enum class Backend
+{
+    WinMF_CPU,
+    WinMF_GPU,
+    DShow
+};
+static Backend g_backend = Backend::WinMF_GPU;
+
 /**
  * @brief Constructor — selects platform-specific provider.
  */
 CaptureManager::CaptureManager()
 {
-#ifdef GCAP_WIN_DSHOW
-    provider_ = std::make_unique<DShowProvider>();
-#elif defined(GCAP_WIN_MF)
-    provider_ = std::make_unique<WinMFProvider>();
-#else
-    provider_ = nullptr;
-#endif
+    switch (g_backend)
+    {
+    case Backend::DShow:
+        provider_ = std::make_unique<DShowProvider>();
+        break;
+    case Backend::WinMF_CPU:
+    case Backend::WinMF_GPU:
+    default:
+        provider_ = std::make_unique<WinMFProvider>(
+            g_backend == Backend::WinMF_GPU // 傳一個 preferGpu flag
+        );
+        break;
+    }
 }
 
 /**
@@ -29,6 +43,23 @@ CaptureManager::CaptureManager()
 CaptureManager::~CaptureManager()
 {
     close();
+}
+
+void CaptureManager::setBackendInt(int v)
+{
+    switch (v)
+    {
+    case 0:
+        g_backend = Backend::WinMF_CPU;
+        break;
+    case 1:
+        g_backend = Backend::WinMF_GPU;
+        break;
+    case 2:
+    default:
+        g_backend = Backend::DShow;
+        break;
+    }
 }
 
 /**

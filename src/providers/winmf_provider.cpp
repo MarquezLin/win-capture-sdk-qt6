@@ -18,11 +18,11 @@ static std::string hr_msg(HRESULT hr)
     return oss.str();
 }
 
-#define DBG(stage, hr)                                                                \
-    do                                                                                \
-    {                                                                                 \
-        std::string __m = std::string("[WinMF] ") + stage + " failed: " + hr_msg(hr); \
-        OutputDebugStringA((__m + "\n").c_str());                                     \
+#define DBG(stage, hr)                                                          \
+    do                                                                          \
+    {                                                                           \
+        std::string __m = std::string("[WinMF] ") + stage + " : " + hr_msg(hr); \
+        OutputDebugStringA((__m + "\n").c_str());                               \
     } while (0)
 
 static void ensure_mf()
@@ -56,7 +56,10 @@ static std::string utf8_from_wide(const wchar_t *ws)
     return std::string(buf.data());
 }
 
-WinMFProvider::WinMFProvider() {}
+WinMFProvider::WinMFProvider(bool preferGpu)
+    : prefer_gpu_(preferGpu)
+{
+}
 WinMFProvider::~WinMFProvider()
 {
     stop();
@@ -170,22 +173,24 @@ bool WinMFProvider::open(int index)
 {
     ensure_mf();
 
-    // 先試 GPU + DXGI 管線
-    if (create_d3d() && create_reader_with_dxgi(index) && use_dxgi_)
+    if (prefer_gpu_)
     {
-        GUID sub = GUID_NULL;
-        UINT w = 0, h = 0, fn = 0, fd = 1;
-        if (pick_best_native(sub, w, h, fn, fd) && ensure_rt_and_pipeline((int)w, (int)h))
+        // 先試 GPU + DXGI 管線
+        if (create_d3d() && create_reader_with_dxgi(index) && use_dxgi_)
         {
-            cur_subtype_ = sub;
-            cur_w_ = (int)w;
-            cur_h_ = (int)h;
-            cpu_path_ = false; // 讓 loop() 走 GPU 分支
-            OutputDebugStringA("[WinMF] open(): using DXGI/GPU pipeline\n");
-            return true;
+            GUID sub = GUID_NULL;
+            UINT w = 0, h = 0, fn = 0, fd = 1;
+            if (pick_best_native(sub, w, h, fn, fd) && ensure_rt_and_pipeline((int)w, (int)h))
+            {
+                cur_subtype_ = sub;
+                cur_w_ = (int)w;
+                cur_h_ = (int)h;
+                cpu_path_ = false;
+                OutputDebugStringA("[WinMF] open(): using DXGI/GPU pipeline\n");
+                return true;
+            }
+            OutputDebugStringA("[WinMF] open(): DXGI path failed after pick_best_native/ensure_rt, fallback to CPU\n");
         }
-
-        OutputDebugStringA("[WinMF] open(): DXGI path failed after pick_best_native/ensure_rt, fallback to CPU\n");
     }
 
     // ---- CPU fallback ----
@@ -433,16 +438,65 @@ bool WinMFProvider::create_reader_with_dxgi(int devIndex)
     rdAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
     rdAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
 
-    hr = MFCreateSourceReaderFromMediaSource(source_.Get(), rdAttr.Get(), &reader_);
-    if (FAILED(hr))
+    if (!source_)
     {
-        DBG("DXGI: MFCreateSourceReaderFromMediaSource failed", hr);
-        // DXGI 完全不支援，讓 open() 去走 CPU fallback
-        reader_.Reset();
-        source_.Reset();
+        DBG("DXGI: source_ is null before MFCreateSourceReaderFromMediaSource", 0);
+        return false;
+    }
+    if (!dxgi_mgr_)
+    {
+        DBG("DXGI: dxgi_mgr_ is null before MFCreateSourceReaderFromMediaSource", 0);
         return false;
     }
 
+    hr = MFCreateSourceReaderFromMediaSource(source_.Get(), rdAttr.Get(), reader_.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        DBG("DXGI: MFCreateSourceReaderFromMediaSource (with attr) failed", hr);
+
+        // 如果是你現在遇到的 E_INVALIDARG，就改用「重新 activate 一顆新的 source 再建乾淨 reader」的方式重試
+        if (hr == E_INVALIDARG)
+        {
+            DBG("DXGI: retry MFCreateSourceReaderFromMediaSource with nullptr attr", hr);
+
+            // 先把舊的 reader / source 都清掉，因為舊的 source 很可能已經被 Shutdown
+            reader_.Reset();
+            source_.Reset();
+
+            // ★ 重新 activate 一顆新的 MediaSource（用同一個 devIndex）
+            HRESULT hr2 = activate_source(source_);
+            if (FAILED(hr2) || !source_)
+            {
+                DBG("DXGI: activate_source (retry) failed", hr2);
+                source_.Reset();
+                return false; // DXGI 這條就放棄，最後 open() 會走 CPU fallback
+            }
+
+            // 用「不帶任何 attributes」建一個最乾淨的 reader
+            hr = MFCreateSourceReaderFromMediaSource(
+                source_.Get(),
+                nullptr,
+                reader_.ReleaseAndGetAddressOf());
+            if (FAILED(hr))
+            {
+                DBG("DXGI: MFCreateSourceReaderFromMediaSource (no attr) also failed", hr);
+                reader_.Reset();
+                source_.Reset();
+                return false;
+            }
+
+            DBG("DXGI: CreateReader(no attr) succeeded, continue DXGI path", hr);
+        }
+        else
+        {
+            // 不是 E_INVALIDARG，就當成不支援 DXGI，讓 open() fallback 到 CPU
+            reader_.Reset();
+            source_.Reset();
+            return false;
+        }
+    }
+
+    // 能走到這裡代表 reader_ 已經成功建立（帶 attr 或無 attr）
     use_dxgi_ = true;
     cpu_path_ = false;
     DBG("DXGI: DXGI+VP SUCCESS", hr);
@@ -804,6 +858,15 @@ bool WinMFProvider::render_yuv_to_rgba(ID3D11Texture2D *yuvTex)
 
     float clear[4] = {0, 0, 0, 1};
     ID3D11RenderTargetView *rtv = rtv_rgba_.Get();
+    // 設定 Viewport，否則 Draw 會跑在「沒有 viewport」的狀態下，畫面是 undefined（現在你看到的黑畫面＋D3D11 WARNING）
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = static_cast<FLOAT>(cur_w_);
+    vp.Height = static_cast<FLOAT>(cur_h_);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ctx_->RSSetViewports(1, &vp);
     ctx_->OMSetRenderTargets(1, &rtv, nullptr);
     ctx_->ClearRenderTargetView(rtv, clear);
     ctx_->Draw(6, 0);
@@ -967,24 +1030,108 @@ void WinMFProvider::loop()
             else
                 fps_avg_ = fps_avg_ * 0.9 + fps_now * 0.1;
         }
+
         last_pts_ns_ = (uint64_t)ts * 100;
 
         ComPtr<IMFMediaBuffer> buf;
         if (FAILED(sample->ConvertToContiguousBuffer(&buf)))
             continue;
 
+        // --- 嘗試：優先吃 IMFDXGIBuffer；沒有就自己 Upload ---
         ComPtr<IMFDXGIBuffer> dxgibuf;
-        if (FAILED(buf.As(&dxgibuf)))
-            continue;
+        HRESULT hrDX = buf.As(&dxgibuf);
 
         ComPtr<ID3D11Texture2D> yuvTex;
-        UINT subres = 0;
-        if (FAILED(dxgibuf->GetResource(IID_PPV_ARGS(&yuvTex))))
+
+        if (SUCCEEDED(hrDX) && dxgibuf)
+        {
+            // 裝置真的有 DXGI surface → 直接拿 GPU texture
+            UINT subres = 0;
+            if (FAILED(dxgibuf->GetResource(IID_PPV_ARGS(&yuvTex))))
+            {
+                DBG("DXGI: GetResource from IMFDXGIBuffer failed", E_FAIL);
+                continue;
+            }
+            dxgibuf->GetSubresourceIndex(&subres);
+        }
+        else
+        {
+            // ★ 沒有 IMFDXGIBuffer：從 CPU NV12/P010 buffer Upload 到 D3D11 texture，再走 shader
+            BYTE *pData = nullptr;
+            DWORD maxLen = 0, curLen = 0;
+            if (FAILED(buf->Lock(&pData, &maxLen, &curLen)))
+                continue;
+
+            if (!ensure_upload_yuv(cur_w_, cur_h_))
+            {
+                buf->Unlock();
+                continue;
+            }
+
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            HRESULT hrMap = ctx_->Map(upload_yuv_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (FAILED(hrMap))
+            {
+                buf->Unlock();
+                DBG("DXGI: Map(upload_yuv_) failed", hrMap);
+                continue;
+            }
+
+            int w = cur_w_;
+            int h = cur_h_;
+
+            if (cur_subtype_ == MFVideoFormat_NV12)
+            {
+                // NV12: Y 平面 + 交錯 UV，這裡先假設 stride == width
+                const uint8_t *srcY = pData;
+                const uint8_t *srcUV = pData + w * h;
+                uint8_t *dst = static_cast<uint8_t *>(mapped.pData);
+
+                // Y plane
+                for (int y = 0; y < h; ++y)
+                    memcpy(dst + mapped.RowPitch * y,
+                           srcY + w * y,
+                           w);
+                // UV plane (h/2 行，pitch 相同)
+                for (int y = 0; y < h / 2; ++y)
+                    memcpy(dst + mapped.RowPitch * (h + y),
+                           srcUV + w * y,
+                           w);
+            }
+            else if (cur_subtype_ == MFVideoFormat_P010)
+            {
+                // P010: 10-bit，2 bytes per sample
+                const uint8_t *srcY = pData;
+                const uint8_t *srcUV = pData + w * h * 2;
+                uint8_t *dst = static_cast<uint8_t *>(mapped.pData);
+                size_t rowBytes = (size_t)w * 2;
+
+                for (int y = 0; y < h; ++y)
+                    memcpy(dst + mapped.RowPitch * y,
+                           srcY + rowBytes * y,
+                           rowBytes);
+                for (int y = 0; y < h / 2; ++y)
+                    memcpy(dst + mapped.RowPitch * (h + y),
+                           srcUV + rowBytes * y,
+                           rowBytes);
+            }
+
+            ctx_->Unmap(upload_yuv_.Get(), 0);
+            buf->Unlock();
+
+            yuvTex = upload_yuv_.Get();
+        }
+
+        if (!yuvTex)
             continue;
-        dxgibuf->GetSubresourceIndex(&subres);
 
         if (!render_yuv_to_rgba(yuvTex.Get()))
+        {
+            DBG("DXGI: render_yuv_to_rgba failed", E_FAIL);
             continue;
+        }
+
+        // ★後面原本的 GPU overlay / CopyResource / Map / vcb_ 全部保留
 
         // GPU overlay
         wchar_t wdev[256] = L"";
@@ -1038,4 +1185,39 @@ void WinMFProvider::loop()
             ctx_->Unmap(rt_stage_.Get(), 0);
         }
     }
+}
+
+bool WinMFProvider::ensure_upload_yuv(int w, int h)
+{
+    if (!d3d_)
+        return false;
+
+    if (upload_yuv_)
+    {
+        D3D11_TEXTURE2D_DESC desc{};
+        upload_yuv_->GetDesc(&desc);
+        if ((int)desc.Width == w && (int)desc.Height == h)
+            return true; // 尺寸相同就重複使用
+        upload_yuv_.Reset();
+    }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Format = (cur_subtype_ == MFVideoFormat_P010) ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+    td.Usage = D3D11_USAGE_DYNAMIC;             // 可 CPU 寫入
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;  // 給 pixel shader 當 SRV 用
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; // CPU write
+    td.MiscFlags = 0;
+
+    HRESULT hr = d3d_->CreateTexture2D(&td, nullptr, &upload_yuv_);
+    if (FAILED(hr))
+    {
+        DBG("DXGI: Create upload NV12 texture failed", hr);
+        return false;
+    }
+    return true;
 }

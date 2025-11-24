@@ -17,8 +17,8 @@ target_include_directories(gcapture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Windows / Media Foundation
 if (WIN32)
-  # target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF GCAP_WIN_DSHOW)
-  target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF)
+  target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF GCAP_WIN_DSHOW)
+#   target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF)
   target_compile_definitions(gcapture PRIVATE GCAPTURE_BUILD)
 
   # ★ 把常見會漏的系統庫一次補齊

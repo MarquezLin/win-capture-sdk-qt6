@@ -107,6 +107,11 @@ extern "C"
         return st;
     }
 
+    GCAP_API void gcap_set_backend(int backend)
+    {
+        CaptureManager::setBackendInt(backend);
+    }
+
     /* 臨時導出一個標記符號，方便用 dumpbin /exports 檢查 */
     GCAP_API int gcap__marker_export(void) { return 42; }
 

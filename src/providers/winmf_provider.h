@@ -26,7 +26,8 @@ using Microsoft::WRL::ComPtr;
 class WinMFProvider : public ICaptureProvider
 {
 public:
-    WinMFProvider();           // Constructor - initializes Media Foundation
+    // WinMFProvider();           // Constructor - initializes Media Foundation
+    explicit WinMFProvider(bool preferGpu = true);
     ~WinMFProvider() override; // Destructor - stops and releases resources
 
     // Enumerate available video capture devices
@@ -98,6 +99,9 @@ private:
     ComPtr<ID3D11RenderTargetView> rtv_rgba_;
     ComPtr<ID3D11Texture2D> rt_stage_;
 
+    // ★新增：CPU→GPU 上傳用的 NV12 / P010 texture
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> upload_yuv_;
+
     // Pipeline resources
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> ps_nv12_;
@@ -130,6 +134,9 @@ private:
     bool render_yuv_to_rgba(ID3D11Texture2D *yuvTex);
     bool gpu_overlay_text(const wchar_t *text);
 
+    // ★新增：確保 upload_yuv_ 尺寸 / format 正確
+    bool ensure_upload_yuv(int w, int h);
+
     // utils
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>
     createSRV_NV12(ID3D11Device *dev, ID3D11Texture2D *tex, bool uv);
@@ -140,4 +147,6 @@ private:
     bool create_reader_cpu_only(int devIndex);
 
     std::vector<uint8_t> cpu_argb_;
+
+    bool prefer_gpu_ = true;
 };

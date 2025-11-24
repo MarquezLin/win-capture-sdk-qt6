@@ -18,6 +18,13 @@ extern "C"
 
     typedef enum
     {
+        GCAP_BACKEND_WINMF_CPU = 0,
+        GCAP_BACKEND_WINMF_GPU = 1,
+        GCAP_BACKEND_DSHOW = 2
+    } gcap_backend_t;
+
+    typedef enum
+    {
         GCAP_OK = 0,
         GCAP_EINVAL,
         GCAP_ENODEV,
@@ -75,6 +82,7 @@ extern "C"
     gcap_status_t gcap_start(gcap_handle h);
     gcap_status_t gcap_stop(gcap_handle h);
     gcap_status_t gcap_close(gcap_handle h);
+    GCAP_API void gcap_set_backend(int backend);
 
     const char *gcap_strerror(gcap_status_t);
 
