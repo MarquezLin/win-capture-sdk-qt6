@@ -4,6 +4,9 @@ project(win_capture_sdk LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 # set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# ---- NVAPI root: 給整個專案共用 ----
+set(NVAPI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi")
+
 add_library(gcapture SHARED
     src/core/capture_manager.cpp
     src/core/frame_converter.cpp
@@ -21,6 +24,9 @@ if (WIN32)
 #   target_compile_definitions(gcapture PRIVATE GCAP_WIN_MF)
   target_compile_definitions(gcapture PRIVATE GCAPTURE_BUILD)
 
+#   # ---- NVAPI 路徑設定 ----
+#   target_include_directories(gcapture PRIVATE "${NVAPI_ROOT}/include")
+
   # ★ 把常見會漏的系統庫一次補齊
   target_link_libraries(gcapture PRIVATE
       mfplat mf mfuuid mfreadwrite      # Media Foundation
@@ -31,6 +37,7 @@ if (WIN32)
       dxgi d3d11 d2d1 dwrite            # Direct3D
       D3DCompiler                       # Direct3D
       strmiids                          # DirectShow IIDs
+    #   "${NVAPI_ROOT}/lib/x64/nvapi64.lib"   # NVAPI
   )
 
   # 檔案含中文/UTF-8
