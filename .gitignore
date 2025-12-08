@@ -17,3 +17,4 @@
 *.ilk
 *.log
 /demos/qt6_viewer/
+/third_party/edid-decode
