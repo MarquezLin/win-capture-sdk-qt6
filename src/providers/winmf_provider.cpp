@@ -299,6 +299,10 @@ void WinMFProvider::close()
     vs_.Reset();
     ps_nv12_.Reset();
     ps_p010_.Reset();
+    cs_nv12_.Reset();
+    cs_params_.Reset();
+    rt_uav_.Reset();
+
     if (dxgi_mgr_)
         dxgi_mgr_.Reset();
     ctx1_.Reset();
@@ -681,6 +685,50 @@ float4 main(float4 pos:SV_Position, float2 uv:TEXCOORD0) : SV_Target
 }
 )";
 
+// NV12 → RGBA 的 Compute Shader 版本
+static const char *g_cs_nv12 = R"(
+Texture2D<float>  texY    : register(t0);  // Y 平面（R8_UNORM → 0..1）
+Texture2D<float2> texUV   : register(t1);  // UV 平面（R8G8_UNORM → 0..1）
+RWTexture2D<float4> texOut : register(u0); // 輸出 RGBA8
+
+cbuffer Params : register(b0)
+{
+    uint width;
+    uint height;
+};
+
+[numthreads(16, 16, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    uint x = tid.x;
+    uint y = tid.y;
+
+    if (x >= width || y >= height)
+        return;
+
+    // 讀取 Y / UV（NV12：2x2 共用一組 UV）
+    float  yNorm = texY .Load(int3(x, y, 0));         // 0..1
+    float2 uvNorm= texUV.Load(int3(x / 2, y / 2, 0)); // 0..1
+
+    float Y = yNorm * 255.0;
+    float U = (uvNorm.x - 0.5) * 255.0;
+    float V = (uvNorm.y - 0.5) * 255.0;
+
+    float c = Y - 16.0;
+    float d = U;
+    float e = V;
+
+    float r = 1.164383 * c + 1.792741 * e;
+    float g = 1.164383 * c - 0.213249 * d - 0.532909 * e;
+    float b = 1.164383 * c + 2.112402 * d;
+
+    float3 rgb = float3(r, g, b) / 255.0;
+    rgb = saturate(rgb);
+
+    texOut[uint2(x, y)] = float4(rgb, 1.0);
+}
+)";
+
 bool WinMFProvider::create_shaders_and_states()
 {
     // Compile shaders
@@ -745,7 +793,7 @@ bool WinMFProvider::ensure_rt_and_pipeline(int w, int h)
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc = {1, 0};
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     if (FAILED(d3d_->CreateTexture2D(&td, nullptr, &rt_rgba_)))
         return false;
     if (FAILED(d3d_->CreateRenderTargetView(rt_rgba_.Get(), nullptr, &rtv_rgba_)))
@@ -839,6 +887,11 @@ bool WinMFProvider::render_yuv_to_rgba(ID3D11Texture2D *yuvTex)
     }
     if (!srvY || !srvUV)
         return false;
+
+    if (use_compute_nv12_ && cur_subtype_ == MFVideoFormat_NV12)
+    {
+        return render_nv12_to_rgba_cs(srvY.Get(), srvUV.Get());
+    }
 
     // Set pipeline
     UINT stride = sizeof(float) * 4, offset = 0;
@@ -1219,5 +1272,124 @@ bool WinMFProvider::ensure_upload_yuv(int w, int h)
         DBG("DXGI: Create upload NV12 texture failed", hr);
         return false;
     }
+    return true;
+}
+
+// 建立/快取 Compute Shader 與 constant buffer
+bool WinMFProvider::ensure_compute_shader()
+{
+    if (cs_nv12_)
+        return true;
+    if (!d3d_)
+        return false;
+
+    ComPtr<ID3DBlob> csb;
+    ComPtr<ID3DBlob> err;
+
+    HRESULT hr = D3DCompile(
+        g_cs_nv12,
+        strlen(g_cs_nv12),
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "cs_5_0",
+        0,
+        0,
+        &csb,
+        &err);
+    if (FAILED(hr))
+    {
+        if (err)
+            OutputDebugStringA((const char *)err->GetBufferPointer());
+        DBG("DXGI: D3DCompile(g_cs_nv12) failed", hr);
+        return false;
+    }
+
+    hr = d3d_->CreateComputeShader(
+        csb->GetBufferPointer(),
+        csb->GetBufferSize(),
+        nullptr,
+        &cs_nv12_);
+    if (FAILED(hr))
+    {
+        DBG("DXGI: CreateComputeShader(cs_nv12_) failed", hr);
+        return false;
+    }
+
+    // constant buffer：存 width/height
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(uint32_t) * 4;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d3d_->CreateBuffer(&bd, nullptr, &cs_params_);
+    if (FAILED(hr))
+    {
+        DBG("DXGI: CreateBuffer(cs_params_) failed", hr);
+        return false;
+    }
+
+    return true;
+}
+
+// 用 Compute Shader 把 NV12 轉成 rt_rgba_（RGBA8）
+bool WinMFProvider::render_nv12_to_rgba_cs(ID3D11ShaderResourceView *srvY,
+                                           ID3D11ShaderResourceView *srvUV)
+{
+    if (!srvY || !srvUV || !rt_rgba_ || !ctx_)
+        return false;
+    if (!ensure_compute_shader())
+        return false;
+
+    // 建立/快取 rt_rgba_ 對應的 UAV
+    if (!rt_uav_)
+    {
+        // 讓 D3D 幫我們用這張貼圖本來的格式建立 UAV
+        HRESULT hr = d3d_->CreateUnorderedAccessView(rt_rgba_.Get(), nullptr, &rt_uav_);
+        if (FAILED(hr))
+        {
+            DBG("DXGI: CreateUnorderedAccessView(rt_rgba_) failed", hr);
+            return false;
+        }
+    }
+
+    // 更新 constant buffer（寬、高）
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hrMap = ctx_->Map(cs_params_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hrMap))
+    {
+        DBG("DXGI: Map(cs_params_) failed", hrMap);
+        return false;
+    }
+    auto *p = reinterpret_cast<uint32_t *>(mapped.pData);
+    p[0] = static_cast<uint32_t>(cur_w_);
+    p[1] = static_cast<uint32_t>(cur_h_);
+    ctx_->Unmap(cs_params_.Get(), 0);
+
+    ID3D11ShaderResourceView *srvs[2] = {srvY, srvUV};
+    ID3D11UnorderedAccessView *uavs[1] = {rt_uav_.Get()};
+    ID3D11Buffer *cbs[1] = {cs_params_.Get()};
+
+    ctx_->CSSetShader(cs_nv12_.Get(), nullptr, 0);
+    ctx_->CSSetShaderResources(0, 2, srvs);
+    ctx_->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    ctx_->CSSetConstantBuffers(0, 1, cbs);
+
+    UINT gx = (cur_w_ + 15) / 16;
+    UINT gy = (cur_h_ + 15) / 16;
+    ctx_->Dispatch(gx, gy, 1);
+
+    // 清掉 CS 綁定，避免影響其他地方
+    ID3D11ShaderResourceView *nullSrvs[2] = {nullptr, nullptr};
+    ID3D11UnorderedAccessView *nullUavs[1] = {nullptr};
+    ID3D11Buffer *nullCb[1] = {nullptr};
+
+    ctx_->CSSetShader(nullptr, nullptr, 0);
+    ctx_->CSSetShaderResources(0, 2, nullSrvs);
+    ctx_->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+    ctx_->CSSetConstantBuffers(0, 1, nullCb);
+
     return true;
 }

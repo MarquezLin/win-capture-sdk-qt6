@@ -99,8 +99,16 @@ private:
     ComPtr<ID3D11RenderTargetView> rtv_rgba_;
     ComPtr<ID3D11Texture2D> rt_stage_;
 
-    // ★新增：CPU→GPU 上傳用的 NV12 / P010 texture
+    // CPU→GPU 上傳用的 NV12 / P010 texture
     Microsoft::WRL::ComPtr<ID3D11Texture2D> upload_yuv_;
+
+    // +++ Compute shader (NV12 → RGBA) + UAV for output
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> cs_nv12_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> cs_params_;           // 存 width/height
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> rt_uav_; // rt_rgba_ 對應的 UAV
+
+    // 是否啟用 NV12 的 compute 路徑（之後你也可以拉成 UI 開關）
+    bool use_compute_nv12_ = true; // 先預設開啟
 
     // Pipeline resources
     ComPtr<ID3D11VertexShader> vs_;
@@ -134,8 +142,13 @@ private:
     bool render_yuv_to_rgba(ID3D11Texture2D *yuvTex);
     bool gpu_overlay_text(const wchar_t *text);
 
-    // ★新增：確保 upload_yuv_ 尺寸 / format 正確
+    // 確保 upload_yuv_ 尺寸 / format 正確
     bool ensure_upload_yuv(int w, int h);
+
+    // Compute shader 相關 helper
+    bool ensure_compute_shader();
+    bool render_nv12_to_rgba_cs(ID3D11ShaderResourceView *srvY,
+                                ID3D11ShaderResourceView *srvUV);
 
     // utils
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>
