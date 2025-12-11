@@ -80,6 +80,8 @@ extern "C"
     gcap_status_t gcap_set_buffers(gcap_handle h, int count, size_t bytes_hint);
     gcap_status_t gcap_set_callbacks(gcap_handle h, gcap_on_video_cb vcb, gcap_on_error_cb ecb, void *user);
     gcap_status_t gcap_start(gcap_handle h);
+    gcap_status_t gcap_start_recording(gcap_handle h, const char *path_utf8);
+    gcap_status_t gcap_stop_recording(gcap_handle h);
     gcap_status_t gcap_stop(gcap_handle h);
     gcap_status_t gcap_close(gcap_handle h);
     GCAP_API void gcap_set_backend(int backend);

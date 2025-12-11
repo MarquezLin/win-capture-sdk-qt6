@@ -6,6 +6,8 @@ EXPORTS
     gcap_set_buffers
     gcap_set_callbacks
     gcap_start
+    gcap_start_recording
+    gcap_stop_recording
     gcap_stop
     gcap_close
     gcap_strerror

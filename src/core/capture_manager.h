@@ -88,6 +88,8 @@ public:
     gcap_status_t setBuffers(int count, size_t bytes_hint);
     gcap_status_t setCallbacks(gcap_on_video_cb v, gcap_on_error_cb e, void *user);
     gcap_status_t start();
+    gcap_status_t startRecording(const char *pathUtf8);
+    gcap_status_t stopRecording();
     gcap_status_t stop();
     gcap_status_t close();
 

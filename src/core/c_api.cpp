@@ -89,6 +89,20 @@ extern "C"
         return h->mgr.start();
     }
 
+    gcap_status_t gcap_start_recording(gcap_handle h, const char *path_utf8)
+    {
+        if (!h)
+            return GCAP_EINVAL;
+        return h->mgr.startRecording(path_utf8);
+    }
+
+    gcap_status_t gcap_stop_recording(gcap_handle h)
+    {
+        if (!h)
+            return GCAP_EINVAL;
+        return h->mgr.stopRecording();
+    }
+
     gcap_status_t gcap_stop(gcap_handle h)
     {
         if (!h)

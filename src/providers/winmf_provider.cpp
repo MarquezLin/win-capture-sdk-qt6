@@ -9,6 +9,357 @@
 
 using Microsoft::WRL::ComPtr;
 
+// UTF-8 → UTF-16 (wstring) 工具，用來把檔名丟給 Media Foundation
+static std::wstring utf8_to_wstring(const char *s)
+{
+    if (!s)
+        return std::wstring();
+    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (len <= 0)
+        return std::wstring();
+    std::wstring ws(len - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, &ws[0], len);
+    return ws;
+}
+
+// ---- H.264 / HEVC 錄影器（Media Foundation Sink Writer, 以 NV12 / P010 為輸入）----
+struct WinMFProvider::MfRecorder
+{
+    ComPtr<IMFSinkWriter> writer;
+    DWORD streamIndex = 0;
+    UINT32 width = 0;
+    UINT32 height = 0;
+    UINT32 fpsNum = 0;
+    UINT32 fpsDen = 1;
+    bool isP010 = false;        // false: NV12 → H.264, true: P010 → HEVC
+    LONGLONG firstTs100ns = -1; // 第一幀時間當作 0
+
+    void close()
+    {
+        if (writer)
+        {
+            writer->Finalize();
+            writer.Reset();
+        }
+        firstTs100ns = -1;
+    }
+
+    bool open(const std::wstring &path, UINT32 w, UINT32 h,
+              UINT32 fpsN, UINT32 fpsD, bool p010)
+    {
+        close();
+
+        if (path.empty() || !w || !h || !fpsN || !fpsD)
+            return false;
+
+        isP010 = p010;
+        width = w;
+        height = h;
+        fpsNum = fpsN;
+        fpsDen = fpsD;
+
+        ComPtr<IMFSinkWriter> wtr;
+        ComPtr<IMFMediaType> outType;
+        ComPtr<IMFMediaType> inType;
+
+        HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &wtr);
+        if (FAILED(hr))
+            return false;
+
+        // 輸出：H.264 或 HEVC
+        GUID outSub = isP010 ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+
+        hr = MFCreateMediaType(&outType);
+        if (FAILED(hr))
+            return false;
+
+        hr = outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (FAILED(hr))
+            return false;
+
+        hr = outType->SetGUID(MF_MT_SUBTYPE, outSub);
+        if (FAILED(hr))
+            return false;
+
+        // 簡單給一個 8Mbps 的 bitrate，之後可以再調整或改成參數
+        hr = outType->SetUINT32(MF_MT_AVG_BITRATE, 8000000);
+        if (FAILED(hr))
+            return false;
+
+        hr = outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, w, h);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, fpsN, fpsD);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (FAILED(hr))
+            return false;
+
+        DWORD idx = 0;
+        hr = wtr->AddStream(outType.Get(), &idx);
+        if (FAILED(hr))
+            return false;
+
+        // 輸入：NV12 或 P010
+        GUID inSub = isP010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+
+        hr = MFCreateMediaType(&inType);
+        if (FAILED(hr))
+            return false;
+
+        hr = inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (FAILED(hr))
+            return false;
+
+        hr = inType->SetGUID(MF_MT_SUBTYPE, inSub);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, w, h);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, fpsN, fpsD);
+        if (FAILED(hr))
+            return false;
+
+        hr = MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (FAILED(hr))
+            return false;
+
+        hr = wtr->SetInputMediaType(idx, inType.Get(), nullptr);
+        if (FAILED(hr))
+            return false;
+
+        hr = wtr->BeginWriting();
+        if (FAILED(hr))
+            return false;
+
+        writer = wtr;
+        streamIndex = idx;
+        firstTs100ns = -1;
+
+        // ---- Log 實際使用的 Sink Writer 設定 ----
+        {
+            const char *codecName = isP010 ? "HEVC/H.265" : "H.264/AVC";
+            const char *inputName = isP010 ? "P010 10-bit" : "NV12 8-bit";
+            const UINT32 kbps = 8000000 / 1000;
+
+            std::ostringstream oss;
+            oss << "[WinMF] Recorder open: codec=" << codecName
+                << ", input=" << inputName
+                << ", " << w << "x" << h
+                << " @ " << fpsN;
+            if (fpsD != 1)
+                oss << "/" << fpsD;
+            oss << " fps"
+                << ", target bitrate=" << kbps << " kbps\n";
+
+            OutputDebugStringA(oss.str().c_str());
+        }
+
+        return true;
+    }
+
+    bool writeNV12(const uint8_t *y, const uint8_t *uv,
+                   UINT32 yStride, UINT32 uvStride,
+                   LONGLONG ts100ns)
+    {
+        if (!writer || !y || !uv || isP010)
+            return false;
+
+        if (firstTs100ns < 0)
+            firstTs100ns = ts100ns;
+
+        const UINT32 w = width;
+        const UINT32 h = height;
+
+        const UINT32 rowBytesY = yStride;
+        const UINT32 rowBytesUV = uvStride;
+        const DWORD yBytes = rowBytesY * h;
+        const DWORD uvBytes = rowBytesUV * (h / 2);
+        const DWORD frameBytes = yBytes + uvBytes;
+
+        ComPtr<IMFSample> sample;
+        HRESULT hr = MFCreateSample(&sample);
+        if (FAILED(hr))
+            return false;
+
+        ComPtr<IMFMediaBuffer> buf;
+        hr = MFCreateMemoryBuffer(frameBytes, &buf);
+        if (FAILED(hr))
+            return false;
+
+        BYTE *dst = nullptr;
+        DWORD maxLen = 0;
+        hr = buf->Lock(&dst, &maxLen, nullptr);
+        if (FAILED(hr))
+            return false;
+
+        BYTE *dstY = dst;
+        BYTE *dstUV = dst + yBytes;
+
+        // 拷貝 Y（h 行）
+        for (UINT32 row = 0; row < h; ++row)
+            memcpy(dstY + rowBytesY * row,
+                   y + yStride * row,
+                   rowBytesY);
+
+        // 拷貝 UV（h/2 行）
+        for (UINT32 row = 0; row < h / 2; ++row)
+            memcpy(dstUV + rowBytesUV * row,
+                   uv + uvStride * row,
+                   rowBytesUV);
+
+        buf->Unlock();
+        buf->SetCurrentLength(frameBytes);
+
+        hr = sample->AddBuffer(buf.Get());
+        if (FAILED(hr))
+            return false;
+
+        LONGLONG rtStart = ts100ns - firstTs100ns;
+        sample->SetSampleTime(rtStart);
+
+        LONGLONG duration = 10'000'000LL * fpsDen / fpsNum;
+        sample->SetSampleDuration(duration);
+
+        hr = writer->WriteSample(streamIndex, sample.Get());
+        if (FAILED(hr))
+            return false;
+
+        return true;
+    }
+
+    bool writeP010(const uint8_t *y, const uint8_t *uv,
+                   UINT32 yStrideBytes, UINT32 uvStrideBytes,
+                   LONGLONG ts100ns)
+    {
+        if (!writer || !y || !uv || !isP010)
+            return false;
+
+        if (firstTs100ns < 0)
+            firstTs100ns = ts100ns;
+
+        const UINT32 w = width;
+        const UINT32 h = height;
+
+        const UINT32 rowBytesY = yStrideBytes;
+        const UINT32 rowBytesUV = uvStrideBytes;
+        const DWORD yBytes = rowBytesY * h;
+        const DWORD uvBytes = rowBytesUV * (h / 2);
+        const DWORD frameBytes = yBytes + uvBytes;
+
+        ComPtr<IMFSample> sample;
+        HRESULT hr = MFCreateSample(&sample);
+        if (FAILED(hr))
+            return false;
+
+        ComPtr<IMFMediaBuffer> buf;
+        hr = MFCreateMemoryBuffer(frameBytes, &buf);
+        if (FAILED(hr))
+            return false;
+
+        BYTE *dst = nullptr;
+        DWORD maxLen = 0;
+        hr = buf->Lock(&dst, &maxLen, nullptr);
+        if (FAILED(hr))
+            return false;
+
+        BYTE *dstY = dst;
+        BYTE *dstUV = dst + yBytes;
+
+        for (UINT32 row = 0; row < h; ++row)
+            memcpy(dstY + rowBytesY * row,
+                   y + yStrideBytes * row,
+                   rowBytesY);
+
+        for (UINT32 row = 0; row < h / 2; ++row)
+            memcpy(dstUV + rowBytesUV * row,
+                   uv + uvStrideBytes * row,
+                   rowBytesUV);
+
+        buf->Unlock();
+        buf->SetCurrentLength(frameBytes);
+
+        hr = sample->AddBuffer(buf.Get());
+        if (FAILED(hr))
+            return false;
+
+        LONGLONG rtStart = ts100ns - firstTs100ns;
+        sample->SetSampleTime(rtStart);
+
+        LONGLONG duration = 10'000'000LL * fpsDen / fpsNum;
+        sample->SetSampleDuration(duration);
+
+        hr = writer->WriteSample(streamIndex, sample.Get());
+        if (FAILED(hr))
+            return false;
+
+        return true;
+    }
+};
+
+gcap_status_t WinMFProvider::startRecording(const char *pathUtf8)
+{
+    std::lock_guard<std::mutex> lock(recorderMutex_);
+
+    if (!reader_) // 尚未 open / start
+        return GCAP_ESTATE;
+
+    if (!pathUtf8 || !*pathUtf8)
+        return GCAP_EINVAL;
+
+    // 目前只支援 NV12 / P010 兩種 YUV 型態
+    bool isP010Format = false;
+    if (cur_subtype_ == MFVideoFormat_P010)
+    {
+        isP010Format = true;
+    }
+    else if (cur_subtype_ == MFVideoFormat_NV12)
+    {
+        isP010Format = false;
+    }
+    else
+    {
+        return GCAP_ENOTSUP;
+    }
+
+    if (!recorder_)
+        recorder_ = std::make_unique<MfRecorder>();
+
+    UINT32 w = static_cast<UINT32>(cur_w_);
+    UINT32 h = static_cast<UINT32>(cur_h_);
+    UINT32 fpsN = profile_.fps_num ? profile_.fps_num : 60;
+    UINT32 fpsD = profile_.fps_den ? profile_.fps_den : 1;
+
+    std::wstring wpath = utf8_to_wstring(pathUtf8);
+    if (!recorder_->open(wpath, w, h, fpsN, fpsD, isP010Format))
+        return GCAP_EIO;
+
+    OutputDebugStringA("[WinMF] Recorder: startRecording()\\n");
+    return GCAP_OK;
+}
+
+gcap_status_t WinMFProvider::stopRecording()
+{
+    std::lock_guard<std::mutex> lock(recorderMutex_);
+
+    if (recorder_)
+    {
+        recorder_->close();
+        OutputDebugStringA("[WinMF] Recorder: stopRecording()\\n");
+    }
+    return GCAP_OK;
+}
+
 static std::string hr_msg(HRESULT hr)
 {
     _com_error ce(hr);
@@ -283,6 +634,7 @@ void WinMFProvider::stop()
 
 void WinMFProvider::close()
 {
+    stopRecording();
     reader_.Reset();
     source_.Reset();
     d2d_bitmap_rt_.Reset();
@@ -1028,6 +1380,18 @@ void WinMFProvider::loop()
                 const uint8_t *y = pData;
                 const uint8_t *uv = pData + yStride * cur_h_;
 
+                // --- Recording: NV12 直接送進 Sink Writer (H.264) ---
+                {
+                    std::lock_guard<std::mutex> lock(recorderMutex_);
+                    if (recorder_)
+                    {
+                        recorder_->writeNV12(y, uv,
+                                             static_cast<UINT32>(yStride),
+                                             static_cast<UINT32>(uvStride),
+                                             ts);
+                    }
+                }
+
                 // 轉成 ARGB32 臨時緩衝（確保大小）
                 if (cpu_argb_.size() < (size_t)(cur_w_ * cur_h_ * 4))
                     cpu_argb_.assign(cur_w_ * cur_h_ * 4, 0);
@@ -1138,6 +1502,19 @@ void WinMFProvider::loop()
                 // NV12: Y 平面 + 交錯 UV，這裡先假設 stride == width
                 const uint8_t *srcY = pData;
                 const uint8_t *srcUV = pData + w * h;
+
+                // --- Recording: NV12 直接送進 Sink Writer (H.264) ---
+                {
+                    std::lock_guard<std::mutex> lock(recorderMutex_);
+                    if (recorder_)
+                    {
+                        recorder_->writeNV12(srcY, srcUV,
+                                             static_cast<UINT32>(w),
+                                             static_cast<UINT32>(w),
+                                             ts);
+                    }
+                }
+
                 uint8_t *dst = static_cast<uint8_t *>(mapped.pData);
 
                 // Y plane
@@ -1156,6 +1533,18 @@ void WinMFProvider::loop()
                 // P010: 10-bit，2 bytes per sample
                 const uint8_t *srcY = pData;
                 const uint8_t *srcUV = pData + w * h * 2;
+                // --- Recording: P010 直接送進 Sink Writer (HEVC) ---
+                {
+                    std::lock_guard<std::mutex> lock(recorderMutex_);
+                    if (recorder_)
+                    {
+                        recorder_->writeP010(srcY, srcUV,
+                                             static_cast<UINT32>(w * 2),
+                                             static_cast<UINT32>(w * 2),
+                                             ts);
+                    }
+                }
+
                 uint8_t *dst = static_cast<uint8_t *>(mapped.pData);
                 size_t rowBytes = (size_t)w * 2;
 

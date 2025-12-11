@@ -146,6 +146,30 @@ gcap_status_t CaptureManager::stop()
     return GCAP_OK;
 }
 
+gcap_status_t CaptureManager::startRecording(const char *pathUtf8)
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+
+#ifdef GCAP_WIN_MF
+    if (auto *p = dynamic_cast<WinMFProvider *>(provider_.get()))
+        return p->startRecording(pathUtf8);
+#endif
+    return GCAP_ENOTSUP;
+}
+
+gcap_status_t CaptureManager::stopRecording()
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+
+#ifdef GCAP_WIN_MF
+    if (auto *p = dynamic_cast<WinMFProvider *>(provider_.get()))
+        return p->stopRecording();
+#endif
+    return GCAP_ENOTSUP;
+}
+
 /**
  * @brief Close the current device and release resources.
  */

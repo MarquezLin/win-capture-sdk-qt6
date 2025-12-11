@@ -39,6 +39,10 @@ public:
     // Set the capture profile (resolution, fps, pixel format)
     bool setProfile(const gcap_profile_t &p) override;
 
+    // ---- Recording control (NV12 → H.264, P010 → HEVC) ----
+    gcap_status_t startRecording(const char *pathUtf8);
+    gcap_status_t stopRecording();
+
     // Set number of buffers and size hints (unused here)
     bool setBuffers(int count, size_t bytes_hint) override;
 
@@ -158,6 +162,11 @@ private:
     createSRV_P010(ID3D11Device *dev, ID3D11Texture2D *tex, bool uv);
 
     bool create_reader_cpu_only(int devIndex);
+
+    // ---- Recording (Media Foundation Sink Writer) ----
+    struct MfRecorder;
+    std::unique_ptr<MfRecorder> recorder_;
+    std::mutex recorderMutex_;
 
     std::vector<uint8_t> cpu_argb_;
 
