@@ -30,6 +30,10 @@ public:
     explicit WinMFProvider(bool preferGpu = true);
     ~WinMFProvider() override; // Destructor - stops and releases resources
 
+    // 讓外部指定要用哪一張 D3D11 Adapter（DXGI EnumAdapters1 的 index）
+    // index = -1 表示「使用系統預設 adapter」
+    static void setPreferredAdapterIndex(int index);
+
     // Enumerate available video capture devices
     bool enumerate(std::vector<gcap_device_info_t> &list) override;
 
@@ -171,4 +175,11 @@ private:
     std::vector<uint8_t> cpu_argb_;
 
     bool prefer_gpu_ = true;
+
+    // ---- GPU（D3D Adapter）相關 ----
+    // 從 DXGI 取得的 GPU 名稱（用在浮水印顯示）
+    std::wstring gpu_name_w_;
+
+    // 全域：目前偏好的 Adapter index（由 UI/C API 設定）
+    static std::atomic<int> s_adapter_index_;
 };

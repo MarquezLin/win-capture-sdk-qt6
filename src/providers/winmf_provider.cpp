@@ -407,10 +407,19 @@ static std::string utf8_from_wide(const wchar_t *ws)
     return std::string(buf.data());
 }
 
+// 初始預設使用系統 default adapter（-1）
+std::atomic<int> WinMFProvider::s_adapter_index_{-1};
+
+void WinMFProvider::setPreferredAdapterIndex(int index)
+{
+    s_adapter_index_.store(index, std::memory_order_relaxed);
+}
+
 WinMFProvider::WinMFProvider(bool preferGpu)
     : prefer_gpu_(preferGpu)
 {
 }
+
 WinMFProvider::~WinMFProvider()
 {
     stop();
@@ -678,32 +687,102 @@ bool WinMFProvider::create_d3d()
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
+
     D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     D3D_FEATURE_LEVEL got{};
-    auto try_create = [&](UINT fl)
+
+    // 目前選擇的 Adapter index（由 UI 經由 C API 設定）
+    const int wantAdapter = s_adapter_index_.load(std::memory_order_relaxed);
+
+    auto try_create = [&](IDXGIAdapter1 *adapter, UINT fl) -> HRESULT
     {
-        return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, fl,
-                                 fls, _countof(fls), D3D11_SDK_VERSION,
-                                 &d3d_, &got, &ctx_);
+        return D3D11CreateDevice(adapter,
+                                 adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                 nullptr,
+                                 fl,
+                                 fls,
+                                 _countof(fls),
+                                 D3D11_SDK_VERSION,
+                                 &d3d_,
+                                 &got,
+                                 &ctx_);
     };
 
-    HRESULT hr = try_create(flags);
+    HRESULT hr = E_FAIL;
+
+    // 1) 如果有指定 Adapter index，先嘗試用該張 GPU 建 device
+    if (wantAdapter >= 0)
+    {
+        ComPtr<IDXGIFactory1> fac;
+        hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(fac.GetAddressOf()));
+        if (SUCCEEDED(hr) && fac)
+        {
+            ComPtr<IDXGIAdapter1> ad;
+            hr = fac->EnumAdapters1(static_cast<UINT>(wantAdapter), &ad);
+            if (SUCCEEDED(hr) && ad)
+            {
+                hr = try_create(ad.Get(), flags);
 #ifdef _DEBUG
-    if (FAILED(hr))
-    {
-        // 自動移除 DEBUG 再試一次
-        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
-        hr = try_create(flags);
-    }
+                if (FAILED(hr))
+                {
+                    // 失敗時移除 DEBUG 再試一次
+                    flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+                    hr = try_create(ad.Get(), flags);
+                }
 #endif
-    if (FAILED(hr))
+                if (FAILED(hr))
+                {
+                    DBG("D3D11CreateDevice(adapter) failed, fallback to default", hr);
+                }
+            }
+            else
+            {
+                DBG("EnumAdapters1(wantAdapter) failed, fallback to default", hr);
+            }
+        }
+    }
+
+    // 2) 如果沒有指定，或指定失敗 → 回到原本的 default adapter 流程
+    if (!d3d_)
     {
-        DBG("D3D11CreateDevice", hr);
-        return false;
+        hr = try_create(nullptr, flags);
+#ifdef _DEBUG
+        if (FAILED(hr))
+        {
+            // 自動移除 DEBUG 再試一次
+            flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+            hr = try_create(nullptr, flags);
+        }
+#endif
+        if (FAILED(hr))
+        {
+            DBG("D3D11CreateDevice(default)", hr);
+            return false;
+        }
     }
 
     d3d_.As(&d3d1_);
     ctx_.As(&ctx1_);
+    d3d_.As(&d3d1_);
+    ctx_.As(&ctx1_);
+
+    // 取得實際使用的 GPU 名稱，之後在 NV12→RGBA overlay 顯示
+    gpu_name_w_.clear();
+    {
+        ComPtr<IDXGIDevice> dxDev;
+        if (SUCCEEDED(d3d_.As(&dxDev)) && dxDev)
+        {
+            ComPtr<IDXGIAdapter> ad;
+            if (SUCCEEDED(dxDev->GetAdapter(&ad)) && ad)
+            {
+                DXGI_ADAPTER_DESC desc{};
+                if (SUCCEEDED(ad->GetDesc(&desc)))
+                {
+                    gpu_name_w_ = desc.Description; // wchar_t[128]
+                }
+            }
+        }
+    }
 
     if (FAILED(MFCreateDXGIDeviceManager(&dxgi_token_, &dxgi_mgr_)))
     {
@@ -1284,23 +1363,18 @@ bool WinMFProvider::render_yuv_to_rgba(ID3D11Texture2D *yuvTex)
 
 bool WinMFProvider::gpu_overlay_text(const wchar_t *text)
 {
-    if (!text || !*text)
+    if (!text || !*text || !d2d_ctx_ || !dwrite_)
         return true;
 
     d2d_ctx_->BeginDraw();
     d2d_ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
 
-    // 半透明黑底
-    D2D1_RECT_F bg = D2D1::RectF(8.f, 8.f, 8.f + 520.f, 8.f + 28.f);
-    d2d_ctx_->FillRectangle(bg, d2d_black_.Get());
-
-    // 文字樣式
+    // ---------- 建立 TextFormat ----------
     Microsoft::WRL::ComPtr<IDWriteTextFormat> fmt;
-
     HRESULT hr = dwrite_->CreateTextFormat(
         L"Segoe UI",
         nullptr,
-        DWRITE_FONT_WEIGHT_SEMI_BOLD, // ← 修正：SEMI_BOLD
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, // 比較醒目
         DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL,
         16.0f,
@@ -1315,9 +1389,57 @@ bool WinMFProvider::gpu_overlay_text(const wchar_t *text)
     fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 
-    D2D1_RECT_F rc = D2D1::RectF(12.f, 10.f, (float)cur_w_ - 12.f, 40.f);
+    // ---------- 用 TextLayout 量測文字寬高 ----------
+    float layoutWidth = static_cast<float>(cur_w_) - 32.0f;
+    if (layoutWidth < 100.0f)
+        layoutWidth = 100.0f;
+    float layoutHeight = 100.0f; // 單行已足夠
 
-    // 修正：ID2D1DeviceContext/RenderTarget 的方法叫 DrawText（不是 DrawTextW）
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+    hr = dwrite_->CreateTextLayout(
+        text,
+        (UINT32)wcslen(text),
+        fmt.Get(),
+        layoutWidth,
+        layoutHeight,
+        &layout);
+    if (FAILED(hr))
+    {
+        d2d_ctx_->EndDraw();
+        return false;
+    }
+
+    DWRITE_TEXT_METRICS metrics{};
+    hr = layout->GetMetrics(&metrics);
+    if (FAILED(hr))
+    {
+        d2d_ctx_->EndDraw();
+        return false;
+    }
+
+    float textWidth = metrics.width;
+    float textHeight = metrics.height;
+
+    // ---------- 黑底 + padding ----------
+    const float padX = 12.0f;
+    const float padY = 6.0f;
+
+    D2D1_RECT_F bg = D2D1::RectF(
+        8.0f,
+        8.0f,
+        8.0f + textWidth + padX * 2.0f,
+        8.0f + textHeight + padY * 2.0f);
+
+    // 半透明黑底
+    d2d_ctx_->FillRectangle(bg, d2d_black_.Get());
+
+    // ---------- 畫文字 ----------
+    D2D1_RECT_F rc = D2D1::RectF(
+        bg.left + padX,
+        bg.top + padY,
+        bg.right - padX,
+        bg.bottom - padY);
+
     d2d_ctx_->DrawText(
         text,
         (UINT32)wcslen(text),
@@ -1325,7 +1447,8 @@ bool WinMFProvider::gpu_overlay_text(const wchar_t *text)
         rc,
         d2d_white_.Get());
 
-    return SUCCEEDED(d2d_ctx_->EndDraw());
+    hr = d2d_ctx_->EndDraw();
+    return SUCCEEDED(hr);
 }
 
 // -------------------- Capture loop --------------------
@@ -1599,12 +1722,20 @@ void WinMFProvider::loop()
 
         double fps_show = fps_avg_ > 0.0 ? fps_avg_ : 0.0;
 
+        const wchar_t *gpuName =
+            (!gpu_name_w_.empty() ? gpu_name_w_.c_str() : L"(GPU: unknown)");
+
         wchar_t line[512];
-        swprintf(line, 512, L"%s | %dx%d @ %.2f fps | %s %s | #%llu",
+        swprintf(line,
+                 512,
+                 L"%s | GPU: %s | %dx%d @ %.2f fps | %s %s | #%llu",
                  (wdev[0] ? wdev : L"Device"),
-                 cur_w_, cur_h_,
+                 gpuName,
+                 cur_w_,
+                 cur_h_,
                  fps_show,
-                 fmtName, bitDepth,
+                 fmtName,
+                 bitDepth,
                  (unsigned long long)frame_id_);
         gpu_overlay_text(line);
 

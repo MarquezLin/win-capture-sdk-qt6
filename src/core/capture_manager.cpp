@@ -17,6 +17,9 @@ enum class Backend
 };
 static Backend g_backend = Backend::WinMF_GPU;
 
+// 預設 D3D Adapter (-1 = 由系統選擇 default adapter)
+static int g_d3d_adapter_index = -1;
+
 /**
  * @brief Constructor — selects platform-specific provider.
  */
@@ -60,6 +63,18 @@ void CaptureManager::setBackendInt(int v)
         g_backend = Backend::DShow;
         break;
     }
+}
+
+void CaptureManager::setD3dAdapterInt(int index)
+{
+    g_d3d_adapter_index = index;
+
+#ifdef GCAP_WIN_MF
+    // 告訴 WinMFProvider 要改用哪一張 GPU
+    WinMFProvider::setPreferredAdapterIndex(index);
+#else
+    (void)index;
+#endif
 }
 
 /**

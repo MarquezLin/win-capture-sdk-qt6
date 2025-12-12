@@ -85,6 +85,9 @@ extern "C"
     gcap_status_t gcap_stop(gcap_handle h);
     gcap_status_t gcap_close(gcap_handle h);
     GCAP_API void gcap_set_backend(int backend);
+    // 選擇要用哪一張 D3D11 Adapter 來做 NV12→RGBA / DXGI 管線
+    // adapter_index = -1 表示使用系統預設（原本的 nullptr / default adapter）
+    GCAP_API void gcap_set_d3d_adapter(int adapter_index);
 
     const char *gcap_strerror(gcap_status_t);
 

@@ -94,6 +94,7 @@ public:
     gcap_status_t close();
 
     static void setBackendInt(int v);
+    static void setD3dAdapterInt(int index);
 
 private:
     std::unique_ptr<ICaptureProvider> provider_; // Active provider instance
