@@ -23,6 +23,12 @@ extern "C"
         GCAP_BACKEND_DSHOW = 2
     } gcap_backend_t;
 
+    enum gcap_profile_mode_t
+    {
+        GCAP_PROFILE_DEVICE_DEFAULT = 0,
+        GCAP_PROFILE_CUSTOM
+    };
+
     typedef enum
     {
         GCAP_OK = 0,
@@ -56,6 +62,7 @@ extern "C"
         int width, height;
         int fps_num, fps_den;
         gcap_pixfmt_t format;
+        gcap_profile_mode_t mode;
     } gcap_profile_t;
 
     typedef struct

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <deque>
 
 #include "gcapture.h"
 #include "../core/capture_manager.h"
@@ -70,6 +71,10 @@ private:
     gcap_on_error_cb ecb_ = nullptr;
     void *user_ = nullptr;
 
+    std::mutex pending_mtx_;
+    std::deque<std::string> pending_logs_;
+    static constexpr size_t kMaxPendingLogs = 256;
+
     // ---- State ----
     std::atomic<bool> running_{false};
     std::thread th_;
@@ -91,7 +96,7 @@ private:
     int cur_w_ = 0;
     int cur_h_ = 0;
     int cur_stride_ = 0;
-    GUID cur_subtype_ = GUID_NULL; // MFVideoFormat_NV12 or MFVideoFormat_P010
+    GUID cur_subtype_ = GUID_NULL; // MFVideoFormat_NV12 or MFVideoFormat_P010 or MFVideoFormat_YUY2
 
     // ---- D3D11 / DXGI ----
     ComPtr<ID3D11Device> d3d_;
@@ -107,8 +112,10 @@ private:
     ComPtr<ID3D11RenderTargetView> rtv_rgba_;
     ComPtr<ID3D11Texture2D> rt_stage_;
 
-    // CPU→GPU 上傳用的 NV12 / P010 texture
+    // CPU→GPU 上傳用的 NV12 / P010 / YUY2  texture
     Microsoft::WRL::ComPtr<ID3D11Texture2D> upload_yuv_;
+    // CPU→GPU 上傳用的 YUY2（打包成 RGBA8_UINT，寬度 = ceil(w/2)）
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> upload_yuy2_packed_;
 
     // +++ Compute shader (NV12 → RGBA) + UAV for output
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> cs_nv12_;
@@ -122,6 +129,7 @@ private:
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> ps_nv12_;
     ComPtr<ID3D11PixelShader> ps_p010_;
+    ComPtr<ID3D11PixelShader> ps_yuy2_;
     ComPtr<ID3D11InputLayout> il_;
     ComPtr<ID3D11Buffer> vb_;
     ComPtr<ID3D11SamplerState> samp_;
@@ -138,6 +146,9 @@ private:
     // --- internal helpers ---
     void loop();
     void emit_error(gcap_status_t c, const char *msg);
+    // open() 階段 callbacks 尚未設好時，先把 GCAP_OK 類型 log 暫存起來
+    void pending_log_push(const char *msg);
+    void pending_log_flush();
 
     // init
     bool create_d3d();
@@ -152,6 +163,8 @@ private:
 
     // 確保 upload_yuv_ 尺寸 / format 正確
     bool ensure_upload_yuv(int w, int h);
+    // 確保 upload_yuy2_packed_ 尺寸 / format 正確（寬度 = ceil(w/2)）
+    bool ensure_upload_yuy2_packed(int w, int h);
 
     // Compute shader 相關 helper
     bool ensure_compute_shader();
