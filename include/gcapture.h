@@ -57,6 +57,65 @@ extern "C"
         unsigned caps; // bitmask: 1<<0:HDMI,1<<1:SDI,1<<2:BIT10...
     } gcap_device_info_t;
 
+    typedef enum
+    {
+        GCAP_INPUT_UNKNOWN = 0,
+        GCAP_INPUT_HDMI = 1,
+        GCAP_INPUT_SDI = 2
+    } gcap_input_t;
+
+    typedef enum
+    {
+        GCAP_RANGE_UNKNOWN = 0,
+        GCAP_RANGE_LIMITED = 1,
+        GCAP_RANGE_FULL = 2
+    } gcap_range_t;
+
+    typedef enum
+    {
+        GCAP_CSP_UNKNOWN = 0,
+        GCAP_CSP_BT601 = 1,
+        GCAP_CSP_BT709 = 2,
+        GCAP_CSP_BT2020 = 3
+    } gcap_colorspace_t;
+
+    typedef struct
+    {
+        char driver_version[64];
+        char firmware_version[64];
+        char serial_number[64];
+        gcap_input_t input;
+        int pcie_gen;   // e.g. 2/3/4/5 (0=unknown)
+        int pcie_lanes; // x1/x4/x8/x16 (0=unknown)
+        int hdcp;       // 0/1, -1=unknown
+    } gcap_device_props_t;
+
+    typedef struct
+    {
+        int width, height;
+        int fps_num, fps_den;  // negotiated FPS
+        gcap_pixfmt_t pixfmt;  // NV12/YUY2/P010/ARGB...
+        int bit_depth;         // 8/10/12 (0=unknown)
+        gcap_colorspace_t csp; // BT.709/BT.2020...
+        gcap_range_t range;    // limited/full
+        int hdr;               // 0/1, -1=unknown
+    } gcap_signal_status_t;
+
+    typedef enum
+    {
+        GCAP_DEINT_AUTO = 0,
+        GCAP_DEINT_OFF,
+        GCAP_DEINT_WEAVE,
+        GCAP_DEINT_BOB
+    } gcap_deinterlace_t;
+
+    typedef struct
+    {
+        gcap_pixfmt_t preferred_pixfmt; // Auto=GCAP_FMT_*?（你可用 NV12/YUY2/P010）
+        gcap_deinterlace_t deinterlace;
+        gcap_range_t force_range; // unknown=auto
+    } gcap_processing_opts_t;
+
     typedef struct
     {
         int width, height;
@@ -95,6 +154,11 @@ extern "C"
     // 選擇要用哪一張 D3D11 Adapter 來做 NV12→RGBA / DXGI 管線
     // adapter_index = -1 表示使用系統預設（原本的 nullptr / default adapter）
     GCAP_API void gcap_set_d3d_adapter(int adapter_index);
+
+    // --- OBS-like "Properties" ---
+    gcap_status_t gcap_get_device_props(gcap_handle h, gcap_device_props_t *out);
+    gcap_status_t gcap_get_signal_status(gcap_handle h, gcap_signal_status_t *out);
+    gcap_status_t gcap_set_processing(gcap_handle h, const gcap_processing_opts_t *opts);
 
     const char *gcap_strerror(gcap_status_t);
 

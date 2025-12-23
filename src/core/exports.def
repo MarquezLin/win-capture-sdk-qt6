@@ -8,7 +8,11 @@ EXPORTS
     gcap_start
     gcap_start_recording
     gcap_stop_recording
+    gcap_set_backend
+    gcap_set_d3d_adapter
+    gcap_get_device_props
+    gcap_get_signal_status
+    gcap_set_processing
     gcap_stop
     gcap_close
     gcap_strerror
-    gcap__marker_export

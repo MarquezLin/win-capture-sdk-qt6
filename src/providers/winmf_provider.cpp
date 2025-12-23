@@ -5,9 +5,208 @@
 #include <sstream>
 #include <comdef.h>  // for _com_error
 #include <windows.h> // for OutputDebugStringA
+#include <string>
+#include <setupapi.h>
+#include <devpkey.h>
+namespace
+{
+    // DEVPROPKEY = { fmtid(GUID), pid }
+    static const DEVPROPKEY kDevPKey_Device_DriverVersion = {
+        {0xa8b865dd, 0x2e3d, 0x4094, {0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6}},
+        3};
+
+    static const DEVPROPKEY kDevPKey_Device_FirmwareVersion = {
+        {0xa8b865dd, 0x2e3d, 0x4094, {0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6}},
+        4};
+
+    static const DEVPROPKEY kDevPKey_Device_SerialNumber = {
+        {0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}},
+        256};
+}
+#pragma comment(lib, "setupapi.lib")
 #include "../core/frame_converter.h"
 
 using Microsoft::WRL::ComPtr;
+
+// --- local helper: wide string -> UTF-8 string ---
+static std::string wide_to_utf8(const std::wstring &ws)
+{
+    if (ws.empty())
+        return {};
+
+    const int len = WideCharToMultiByte(CP_UTF8, 0,
+                                        ws.c_str(), -1,
+                                        nullptr, 0,
+                                        nullptr, nullptr);
+    if (len <= 0)
+        return {};
+
+    std::string out((size_t)len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0,
+                        ws.c_str(), -1,
+                        out.data(), len,
+                        nullptr, nullptr);
+    return out;
+}
+
+// --- compatibility: 讓你檔案裡原本的 utf8_from_wide(...) 全部不用改 ---
+static std::string utf8_from_wide(const std::wstring &ws)
+{
+    return wide_to_utf8(ws);
+}
+
+static gcap_pixfmt_t mfsub_to_gcap(const GUID &sub)
+{
+    if (sub == MFVideoFormat_NV12)
+        return GCAP_FMT_NV12;
+    if (sub == MFVideoFormat_YUY2)
+        return GCAP_FMT_YUY2;
+    if (sub == MFVideoFormat_P010)
+        return GCAP_FMT_P010;
+    if (sub == MFVideoFormat_ARGB32)
+        return GCAP_FMT_ARGB;
+    return GCAP_FMT_ARGB; // fallback（你也可改成 NV12）
+}
+
+static int pixfmt_bitdepth(gcap_pixfmt_t f)
+{
+    switch (f)
+    {
+    case GCAP_FMT_P010:
+    case GCAP_FMT_R210:
+    case GCAP_FMT_V210:
+        return 10;
+    default:
+        return 8;
+    }
+}
+
+static std::wstring get_mf_string(IMFActivate *act, const GUID &key)
+{
+    if (!act)
+        return {};
+    wchar_t *w = nullptr;
+    UINT32 cch = 0;
+    if (FAILED(act->GetAllocatedString(key, &w, &cch)) || !w)
+        return {};
+    std::wstring s(w);
+    CoTaskMemFree(w);
+    return s;
+}
+
+static bool setupapi_open_by_interface(const std::wstring &symLink, HDEVINFO &outSet, SP_DEVINFO_DATA &outDevInfo)
+{
+    outSet = SetupDiCreateDeviceInfoList(nullptr, nullptr);
+    if (outSet == INVALID_HANDLE_VALUE)
+        return false;
+
+    SP_DEVICE_INTERFACE_DATA ifData{};
+    ifData.cbSize = sizeof(ifData);
+    if (!SetupDiOpenDeviceInterfaceW(outSet, symLink.c_str(), 0, &ifData))
+        return false;
+
+    DWORD required = 0;
+    SetupDiGetDeviceInterfaceDetailW(outSet, &ifData, nullptr, 0, &required, nullptr);
+    if (required == 0)
+        return false;
+
+    std::vector<uint8_t> buf(required);
+    auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buf.data());
+    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+    outDevInfo = {};
+    outDevInfo.cbSize = sizeof(outDevInfo);
+    if (!SetupDiGetDeviceInterfaceDetailW(outSet, &ifData, detail, required, nullptr, &outDevInfo))
+        return false;
+
+    return true;
+}
+
+static std::wstring setupapi_get_prop_string(HDEVINFO set, SP_DEVINFO_DATA &devInfo, const DEVPROPKEY &key)
+{
+    DEVPROPTYPE type = 0;
+    DWORD bytes = 0;
+    SetupDiGetDevicePropertyW(set, &devInfo, &key, &type, nullptr, 0, &bytes, 0);
+    if (bytes == 0)
+        return {};
+    std::vector<uint8_t> buf(bytes);
+    if (!SetupDiGetDevicePropertyW(set, &devInfo, &key, &type, buf.data(), (DWORD)buf.size(), &bytes, 0))
+        return {};
+    if (type != DEVPROP_TYPE_STRING)
+        return {};
+    return std::wstring(reinterpret_cast<wchar_t *>(buf.data()));
+}
+
+bool WinMFProvider::getDeviceProps(gcap_device_props_t &out)
+{
+    memset(&out, 0, sizeof(out));
+
+    strncpy_s(out.driver_version, sizeof(out.driver_version), "Unknown", _TRUNCATE);
+    strncpy_s(out.firmware_version, sizeof(out.firmware_version), "Unknown", _TRUNCATE);
+    strncpy_s(out.serial_number, sizeof(out.serial_number), "Unknown", _TRUNCATE);
+
+    if (dev_sym_link_w_.empty())
+        return true;
+
+    HDEVINFO set = INVALID_HANDLE_VALUE;
+    SP_DEVINFO_DATA devInfo{};
+    if (!setupapi_open_by_interface(dev_sym_link_w_, set, devInfo))
+    {
+        if (set != INVALID_HANDLE_VALUE)
+            SetupDiDestroyDeviceInfoList(set);
+        return true;
+    }
+
+    std::wstring drvVer =
+        setupapi_get_prop_string(set, devInfo, kDevPKey_Device_DriverVersion);
+    std::wstring fwVer =
+        setupapi_get_prop_string(set, devInfo, kDevPKey_Device_FirmwareVersion);
+    std::wstring sn =
+        setupapi_get_prop_string(set, devInfo, kDevPKey_Device_SerialNumber);
+
+    if (!drvVer.empty())
+    {
+        auto s = wide_to_utf8(drvVer);
+        strncpy_s(out.driver_version, sizeof(out.driver_version), s.c_str(), _TRUNCATE);
+    }
+
+    if (!fwVer.empty())
+    {
+        auto s = wide_to_utf8(fwVer);
+        strncpy_s(out.firmware_version, sizeof(out.firmware_version), s.c_str(), _TRUNCATE);
+    }
+
+    if (!sn.empty())
+    {
+        auto s = wide_to_utf8(sn);
+        strncpy_s(out.serial_number, sizeof(out.serial_number), s.c_str(), _TRUNCATE);
+    }
+
+    SetupDiDestroyDeviceInfoList(set);
+    return true;
+}
+
+bool WinMFProvider::getSignalStatus(gcap_signal_status_t &out)
+{
+    memset(&out, 0, sizeof(out));
+    out.width = cur_w_;
+    out.height = cur_h_;
+    out.fps_num = (cur_fps_num_ > 0) ? cur_fps_num_ : 0;
+    out.fps_den = (cur_fps_den_ > 0) ? cur_fps_den_ : 1;
+    out.pixfmt = mfsub_to_gcap(cur_subtype_);
+    out.bit_depth = pixfmt_bitdepth(out.pixfmt);
+    out.csp = GCAP_CSP_UNKNOWN;
+    out.range = GCAP_RANGE_UNKNOWN;
+    out.hdr = -1;
+    return (cur_w_ > 0 && cur_h_ > 0);
+}
+
+bool WinMFProvider::setProcessing(const gcap_processing_opts_t &opts)
+{
+    (void)opts;
+    // 先回不支援：等你要做「切 NV12/YUY2/P010 / Deinterlace」再補 setProfile / rebuild reader
+    return false;
+}
 
 // ---- logging helpers (for negotiated media type / stride debug) ----
 static const char *mf_subtype_name(const GUID &g)
@@ -198,81 +397,12 @@ struct WinMFProvider::MfRecorder
         return true;
     }
 
-    bool writeNV12(const uint8_t *y, const uint8_t *uv,
-                   UINT32 yStride, UINT32 uvStride,
-                   LONGLONG ts100ns)
+    // 共用：把 Y/UV 兩個平面依照 stride 寫進單一 buffer，並送進 Sink Writer
+    bool writePlanar(const uint8_t *y, const uint8_t *uv,
+                     UINT32 yStrideBytes, UINT32 uvStrideBytes,
+                     LONGLONG ts100ns)
     {
-        if (!writer || !y || !uv || isP010)
-            return false;
-
-        if (firstTs100ns < 0)
-            firstTs100ns = ts100ns;
-
-        const UINT32 w = width;
-        const UINT32 h = height;
-
-        const UINT32 rowBytesY = yStride;
-        const UINT32 rowBytesUV = uvStride;
-        const DWORD yBytes = rowBytesY * h;
-        const DWORD uvBytes = rowBytesUV * (h / 2);
-        const DWORD frameBytes = yBytes + uvBytes;
-
-        ComPtr<IMFSample> sample;
-        HRESULT hr = MFCreateSample(&sample);
-        if (FAILED(hr))
-            return false;
-
-        ComPtr<IMFMediaBuffer> buf;
-        hr = MFCreateMemoryBuffer(frameBytes, &buf);
-        if (FAILED(hr))
-            return false;
-
-        BYTE *dst = nullptr;
-        DWORD maxLen = 0;
-        hr = buf->Lock(&dst, &maxLen, nullptr);
-        if (FAILED(hr))
-            return false;
-
-        BYTE *dstY = dst;
-        BYTE *dstUV = dst + yBytes;
-
-        // 拷貝 Y（h 行）
-        for (UINT32 row = 0; row < h; ++row)
-            memcpy(dstY + rowBytesY * row,
-                   y + yStride * row,
-                   rowBytesY);
-
-        // 拷貝 UV（h/2 行）
-        for (UINT32 row = 0; row < h / 2; ++row)
-            memcpy(dstUV + rowBytesUV * row,
-                   uv + uvStride * row,
-                   rowBytesUV);
-
-        buf->Unlock();
-        buf->SetCurrentLength(frameBytes);
-
-        hr = sample->AddBuffer(buf.Get());
-        if (FAILED(hr))
-            return false;
-
-        LONGLONG rtStart = ts100ns - firstTs100ns;
-        sample->SetSampleTime(rtStart);
-
-        LONGLONG duration = 10'000'000LL * fpsDen / fpsNum;
-        sample->SetSampleDuration(duration);
-
-        hr = writer->WriteSample(streamIndex, sample.Get());
-        if (FAILED(hr))
-            return false;
-
-        return true;
-    }
-
-    bool writeP010(const uint8_t *y, const uint8_t *uv,
-                   UINT32 yStrideBytes, UINT32 uvStrideBytes,
-                   LONGLONG ts100ns)
-    {
-        if (!writer || !y || !uv || !isP010)
+        if (!writer || !y || !uv)
             return false;
 
         if (firstTs100ns < 0)
@@ -306,15 +436,21 @@ struct WinMFProvider::MfRecorder
         BYTE *dstY = dst;
         BYTE *dstUV = dst + yBytes;
 
+        // 拷貝 Y（h 行）
         for (UINT32 row = 0; row < h; ++row)
+        {
             memcpy(dstY + rowBytesY * row,
                    y + yStrideBytes * row,
                    rowBytesY);
+        }
 
+        // 拷貝 UV（h/2 行）
         for (UINT32 row = 0; row < h / 2; ++row)
+        {
             memcpy(dstUV + rowBytesUV * row,
                    uv + uvStrideBytes * row,
                    rowBytesUV);
+        }
 
         buf->Unlock();
         buf->SetCurrentLength(frameBytes);
@@ -334,6 +470,30 @@ struct WinMFProvider::MfRecorder
             return false;
 
         return true;
+    }
+
+    // 8-bit NV12 → H.264
+    bool writeNV12(const uint8_t *y, const uint8_t *uv,
+                   UINT32 yStride, UINT32 uvStride,
+                   LONGLONG ts100ns)
+    {
+        // 這個 recorder 是 P010 模式的話就不要誤用
+        if (isP010)
+            return false;
+
+        return writePlanar(y, uv, yStride, uvStride, ts100ns);
+    }
+
+    // 10-bit P010 → HEVC
+    bool writeP010(const uint8_t *y, const uint8_t *uv,
+                   UINT32 yStrideBytes, UINT32 uvStrideBytes,
+                   LONGLONG ts100ns)
+    {
+        // 這個 recorder 不是 P010 模式就不要誤用
+        if (!isP010)
+            return false;
+
+        return writePlanar(y, uv, yStrideBytes, uvStrideBytes, ts100ns);
     }
 };
 
@@ -434,18 +594,6 @@ static void ensure_mf()
         } });
 }
 
-static std::string utf8_from_wide(const wchar_t *ws)
-{
-    if (!ws)
-        return {};
-    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1)
-        return {};
-    std::vector<char> buf(n);
-    ::WideCharToMultiByte(CP_UTF8, 0, ws, -1, buf.data(), n, nullptr, nullptr);
-    return std::string(buf.data());
-}
-
 // 初始預設使用系統 default adapter（-1）
 std::atomic<int> WinMFProvider::s_adapter_index_{-1};
 
@@ -518,19 +666,27 @@ bool WinMFProvider::enumerate(std::vector<gcap_device_info_t> &list)
     list.clear();
     for (UINT32 i = 0; i < count; ++i)
     {
-        WCHAR *wname = nullptr;
-        UINT32 cch = 0;
-        if (SUCCEEDED(pp[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &wname, &cch)))
+        gcap_device_info_t di{};
+        di.index = (int)i;
+        di.caps = 0;
+
+        // Friendly name
+        std::wstring wname = get_mf_string(pp[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+        if (!wname.empty())
         {
-            gcap_device_info_t di{};
-            di.index = (int)i;
-            std::string s = utf8_from_wide(wname);
+            std::string s = utf8_from_wide(wname.c_str());
             strncpy(di.name, s.c_str(), sizeof(di.name) - 1);
-            di.name[sizeof(di.name) - 1] = '\0';
-            di.caps = 0;
-            list.push_back(di);
-            CoTaskMemFree(wname);
         }
+
+        // Symbolic link（給後續查 Driver/FW/Serial）
+        std::wstring wlink = get_mf_string(pp[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+        if (!wlink.empty())
+        {
+            std::string s = utf8_from_wide(wlink.c_str());
+            strncpy(di.symbolic_link, s.c_str(), sizeof(di.symbolic_link) - 1);
+        }
+
+        list.push_back(di);
         pp[i]->Release();
     }
     CoTaskMemFree(pp);
@@ -562,12 +718,11 @@ bool WinMFProvider::create_reader_cpu_only(int devIndex)
                                       (void **)source_.ReleaseAndGetAddressOf());
 
     // 讀 FriendlyName 存到 dev_name_
-    WCHAR *wname = nullptr;
-    UINT32 cch = 0;
-    if (SUCCEEDED(pp[devIndex]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &wname, &cch)))
     {
-        dev_name_ = utf8_from_wide(wname);
-        CoTaskMemFree(wname);
+        std::wstring wname = get_mf_string(pp[devIndex], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+        if (!wname.empty())
+            dev_name_ = utf8_from_wide(wname.c_str());
+        dev_sym_link_w_ = get_mf_string(pp[devIndex], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
     }
 
     for (UINT32 i = 0; i < count; ++i)
@@ -999,6 +1154,13 @@ bool WinMFProvider::create_reader_with_dxgi(int devIndex)
 
         hr = pp[devIndex]->ActivateObject(__uuidof(IMFMediaSource),
                                           reinterpret_cast<void **>(out.GetAddressOf()));
+        // 存 FriendlyName + SymbolicLink（GPU path 也要）
+        {
+            std::wstring wname = get_mf_string(pp[devIndex], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+            if (!wname.empty())
+                dev_name_ = utf8_from_wide(wname.c_str());
+            dev_sym_link_w_ = get_mf_string(pp[devIndex], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+        }
 
         for (UINT32 i = 0; i < count; ++i)
             pp[i]->Release();
@@ -1165,6 +1327,8 @@ bool WinMFProvider::pick_best_native(GUID &sub, UINT32 &w, UINT32 &h, UINT32 &fn
             MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &rw, &rh);
             MFGetAttributeRatio(cur.Get(), MF_MT_FRAME_RATE, &rfn, &rfd);
             cur->GetGUID(MF_MT_SUBTYPE, &rsub);
+            cur_fps_num_ = (int)rfn;
+            cur_fps_den_ = (int)rfd;
             cur_stride_ = mf_default_stride_bytes(cur.Get());
             if (cur_stride_ <= 0)
             {
@@ -1821,8 +1985,8 @@ void WinMFProvider::loop()
             else if (cur_subtype_ == MFVideoFormat_NV12)
             {
                 // NV12: Y 面在前，UV 在後
-                int yStride = cur_w_;
-                int uvStride = cur_w_;
+                const int yStride = (cur_stride_ > 0) ? cur_stride_ : cur_w_;
+                const int uvStride = yStride;
                 const uint8_t *y = pData;
                 const uint8_t *uv = pData + yStride * cur_h_;
 
@@ -1838,9 +2002,9 @@ void WinMFProvider::loop()
                     }
                 }
 
-                // 轉成 ARGB32 臨時緩衝（確保大小）
-                if (cpu_argb_.size() < (size_t)(cur_w_ * cur_h_ * 4))
-                    cpu_argb_.assign(cur_w_ * cur_h_ * 4, 0);
+                const size_t needed = (size_t)cur_w_ * (size_t)cur_h_ * 4;
+                if (cpu_argb_.size() < needed)
+                    cpu_argb_.resize(needed);
 
                 gcap::nv12_to_argb(y, uv, cur_w_, cur_h_, yStride, uvStride,
                                    cpu_argb_.data(), cur_w_ * 4);
@@ -1854,12 +2018,12 @@ void WinMFProvider::loop()
             }
             else if (cur_subtype_ == MFVideoFormat_YUY2)
             {
-                // YUY2 → ARGB32
-                int yuy2Stride = cur_w_ * 2;
+                const int yuy2Stride = (cur_stride_ > 0) ? cur_stride_ : (cur_w_ * 2);
                 const uint8_t *yuy2 = pData;
 
-                if (cpu_argb_.size() < (size_t)(cur_w_ * cur_h_ * 4))
-                    cpu_argb_.assign(cur_w_ * cur_h_ * 4, 0);
+                const size_t needed = (size_t)cur_w_ * (size_t)cur_h_ * 4;
+                if (cpu_argb_.size() < needed)
+                    cpu_argb_.resize(needed);
 
                 gcap::yuy2_to_argb(yuy2, cur_w_, cur_h_, yuy2Stride,
                                    cpu_argb_.data(), cur_w_ * 4);

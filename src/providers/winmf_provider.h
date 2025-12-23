@@ -22,6 +22,7 @@
 #include <d3dcompiler.h>
 
 #include <wrl.h>
+#include <string>
 using Microsoft::WRL::ComPtr;
 
 class WinMFProvider : public ICaptureProvider
@@ -63,6 +64,10 @@ public:
     // Set callback functions for video frames and errors
     void setCallbacks(gcap_on_video_cb vcb, gcap_on_error_cb ecb, void *user) override;
 
+    bool getDeviceProps(gcap_device_props_t &out) override;
+    bool getSignalStatus(gcap_signal_status_t &out) override;
+    bool setProcessing(const gcap_processing_opts_t &opts) override;
+
     bool isUsingGpu() const { return use_dxgi_ && !cpu_path_; }
 
 private:
@@ -79,7 +84,8 @@ private:
     std::atomic<bool> running_{false};
     std::thread th_;
     uint64_t frame_id_ = 0;
-    std::string dev_name_; // 目前選用的裝置名稱（UTF-8）
+    std::string dev_name_;        // 目前選用的裝置名稱（UTF-8）
+    std::wstring dev_sym_link_w_; // MF device symbolic link（給 SetupAPI 查 Driver/FW/Serial 用）
     double fps_avg_ = 0.0;
     uint64_t last_pts_ns_ = 0;
     bool use_dxgi_ = false;
@@ -95,6 +101,8 @@ private:
     // Negotiated native output (kept as NV12 or P010)
     int cur_w_ = 0;
     int cur_h_ = 0;
+    int cur_fps_num_ = 0;
+    int cur_fps_den_ = 1;
     int cur_stride_ = 0;
     GUID cur_subtype_ = GUID_NULL; // MFVideoFormat_NV12 or MFVideoFormat_P010 or MFVideoFormat_YUY2
 

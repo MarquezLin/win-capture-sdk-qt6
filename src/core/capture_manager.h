@@ -67,6 +67,23 @@ struct ICaptureProvider
      * @param user User pointer passed to callbacks.
      */
     virtual void setCallbacks(gcap_on_video_cb vcb, gcap_on_error_cb ecb, void *user) = 0;
+
+    // --- OBS-like properties ---
+    virtual bool getDeviceProps(gcap_device_props_t &out)
+    {
+        (void)out;
+        return false;
+    }
+    virtual bool getSignalStatus(gcap_signal_status_t &out)
+    {
+        (void)out;
+        return false;
+    }
+    virtual bool setProcessing(const gcap_processing_opts_t &opts)
+    {
+        (void)opts;
+        return false;
+    }
 };
 
 /**
@@ -92,6 +109,9 @@ public:
     gcap_status_t stopRecording();
     gcap_status_t stop();
     gcap_status_t close();
+    gcap_status_t getDeviceProps(gcap_device_props_t &out);
+    gcap_status_t getSignalStatus(gcap_signal_status_t &out);
+    gcap_status_t setProcessing(const gcap_processing_opts_t &opts);
 
     static void setBackendInt(int v);
     static void setD3dAdapterInt(int index);

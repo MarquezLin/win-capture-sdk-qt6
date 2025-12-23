@@ -34,6 +34,7 @@ if (WIN32)
       oleaut32                          # 有時會被 propvar/COM 轉到
       uuid                              # 一些 COM/IID GUID
       user32 advapi32                   # 低機率需要，但安全
+      setupapi
       dxgi d3d11 d2d1 dwrite            # Direct3D
       D3DCompiler                       # Direct3D
       strmiids                          # DirectShow IIDs

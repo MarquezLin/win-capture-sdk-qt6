@@ -195,3 +195,24 @@ gcap_status_t CaptureManager::close()
     provider_->close();
     return GCAP_OK;
 }
+
+gcap_status_t CaptureManager::getDeviceProps(gcap_device_props_t &out)
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+    return provider_->getDeviceProps(out) ? GCAP_OK : GCAP_ENOTSUP;
+}
+
+gcap_status_t CaptureManager::getSignalStatus(gcap_signal_status_t &out)
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+    return provider_->getSignalStatus(out) ? GCAP_OK : GCAP_ENOTSUP;
+}
+
+gcap_status_t CaptureManager::setProcessing(const gcap_processing_opts_t &opts)
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+    return provider_->setProcessing(opts) ? GCAP_OK : GCAP_ENOTSUP;
+}

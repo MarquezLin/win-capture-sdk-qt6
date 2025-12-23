@@ -121,6 +121,27 @@ extern "C"
         return st;
     }
 
+    gcap_status_t gcap_get_device_props(gcap_handle h, gcap_device_props_t *out)
+    {
+        if (!h || !out)
+            return GCAP_EINVAL;
+        return h->mgr.getDeviceProps(*out);
+    }
+
+    gcap_status_t gcap_get_signal_status(gcap_handle h, gcap_signal_status_t *out)
+    {
+        if (!h || !out)
+            return GCAP_EINVAL;
+        return h->mgr.getSignalStatus(*out);
+    }
+
+    gcap_status_t gcap_set_processing(gcap_handle h, const gcap_processing_opts_t *opts)
+    {
+        if (!h || !opts)
+            return GCAP_EINVAL;
+        return h->mgr.setProcessing(*opts);
+    }
+
     GCAP_API void gcap_set_backend(int backend)
     {
         CaptureManager::setBackendInt(backend);
@@ -130,8 +151,5 @@ extern "C"
     {
         CaptureManager::setD3dAdapterInt(adapter_index);
     }
-
-    /* 臨時導出一個標記符號，方便用 dumpbin /exports 檢查 */
-    GCAP_API int gcap__marker_export(void) { return 42; }
 
 } // extern "C"
