@@ -10,9 +10,10 @@ set(NVAPI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi")
 add_library(gcapture SHARED
     src/core/capture_manager.cpp
     src/core/frame_converter.cpp
-    src/core/c_api.cpp            # C API 包裝，務必有這行
+    src/core/c_api.cpp
     src/providers/winmf_provider.cpp
     src/providers/dshow_provider.cpp 
+    src/audio/audio_manager.cpp
     src/core/exports.def
 )
 
@@ -34,7 +35,7 @@ if (WIN32)
       oleaut32                          # 有時會被 propvar/COM 轉到
       uuid                              # 一些 COM/IID GUID
       user32 advapi32                   # 低機率需要，但安全
-      setupapi
+      setupapi                          #
       dxgi d3d11 d2d1 dwrite            # Direct3D
       D3DCompiler                       # Direct3D
       strmiids                          # DirectShow IIDs

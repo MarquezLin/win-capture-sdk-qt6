@@ -6,6 +6,8 @@
 #include "gcapture.h"
 #include <memory>
 #include <vector>
+#include "../audio/audio_manager.h"
+#include "gcap_audio.h"
 
 extern "C"
 {
@@ -150,6 +152,40 @@ extern "C"
     GCAP_API void gcap_set_d3d_adapter(int adapter_index)
     {
         CaptureManager::setD3dAdapterInt(adapter_index);
+    }
+
+    extern "C" GCAP_API int gcap_get_audio_device_count(void)
+    {
+        auto list = gcap::audio::enumerate_devices();
+        return static_cast<int>(list.size());
+    }
+
+    extern "C" GCAP_API int gcap_enum_audio_devices(
+        gcap_audio_device_t *out,
+        int max_count)
+    {
+        auto list = gcap::audio::enumerate_devices();
+        int total = static_cast<int>(list.size());
+
+        if (!out || max_count <= 0)
+            return total;
+
+        int n = (total < max_count) ? total : max_count;
+
+        for (int i = 0; i < n; ++i)
+        {
+            const auto &d = list[i];
+
+            memset(&out[i], 0, sizeof(gcap_audio_device_t));
+            strncpy_s(out[i].id, d.id.c_str(), GCAP_AUDIO_ID_MAX - 1);
+            strncpy_s(out[i].name, d.name.c_str(), GCAP_AUDIO_NAME_MAX - 1);
+            out[i].channels = d.channels;
+            out[i].sample_rate = d.sample_rate;
+            out[i].bits_per_sample = d.bits_per_sample;
+            out[i].is_float = d.is_float ? 1 : 0;
+        }
+
+        return n;
     }
 
 } // extern "C"

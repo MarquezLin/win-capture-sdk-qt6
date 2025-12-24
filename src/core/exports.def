@@ -16,3 +16,6 @@ EXPORTS
     gcap_stop
     gcap_close
     gcap_strerror
+    gcap_get_audio_device_count
+    gcap_enum_audio_devices
+

@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "gcap_audio.h"
 
 #ifdef _WIN32
 #ifdef GCAPTURE_BUILD
@@ -159,6 +160,13 @@ extern "C"
     gcap_status_t gcap_get_device_props(gcap_handle h, gcap_device_props_t *out);
     gcap_status_t gcap_get_signal_status(gcap_handle h, gcap_signal_status_t *out);
     gcap_status_t gcap_set_processing(gcap_handle h, const gcap_processing_opts_t *opts);
+
+    // 回傳系統可用的 audio capture device 數量
+    GCAP_API int gcap_get_audio_device_count(void);
+
+    // 列舉 audio capture devices
+    // 回傳實際寫入的數量
+    GCAP_API int gcap_enum_audio_devices(gcap_audio_device_t *out_devices, int max_devices);
 
     const char *gcap_strerror(gcap_status_t);
 

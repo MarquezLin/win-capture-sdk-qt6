@@ -6,6 +6,15 @@
 #include <comdef.h>  // for _com_error
 #include <windows.h> // for OutputDebugStringA
 #include <string>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <atomic>
+#include <condition_variable>
+
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <setupapi.h>
 #include <devpkey.h>
 namespace
@@ -27,6 +36,9 @@ namespace
 #include "../core/frame_converter.h"
 
 using Microsoft::WRL::ComPtr;
+
+// WASAPI 需要 ole32
+#pragma comment(lib, "ole32.lib")
 
 // --- local helper: wide string -> UTF-8 string ---
 static std::string wide_to_utf8(const std::wstring &ws)
@@ -251,17 +263,261 @@ static std::wstring utf8_to_wstring(const char *s)
     return ws;
 }
 
+// ------------------------------------------------------------
+// Step 3-2: WASAPI capture (default eCapture endpoint)
+//  - Shared mode
+//  - 48k/2ch/16-bit PCM (let audio engine do mix)
+//  - Event-driven capture
+// ------------------------------------------------------------
+class WasapiCapture
+{
+public:
+    struct Chunk
+    {
+        LONGLONG ts100ns = 0;     // relative timeline
+        LONGLONG dur100ns = 0;    // duration
+        std::vector<uint8_t> pcm; // interleaved PCM16
+    };
+
+    bool startDefault(UINT32 sampleRate, UINT32 channels, UINT32 bits)
+    {
+        stop();
+
+        sampleRate_ = sampleRate;
+        channels_ = channels;
+        bits_ = bits;
+
+        running_.store(true);
+        thread_ = std::thread([this]()
+                              { this->run(); });
+        return true;
+    }
+
+    void stop()
+    {
+        running_.store(false);
+        if (event_)
+            SetEvent(event_);
+        if (thread_.joinable())
+            thread_.join();
+
+        if (captureClient_)
+            captureClient_.Reset();
+        if (audioClient_)
+            audioClient_.Reset();
+        if (dev_)
+            dev_.Reset();
+        if (enumerator_)
+            enumerator_.Reset();
+        if (event_)
+        {
+            CloseHandle(event_);
+            event_ = nullptr;
+        }
+
+        std::lock_guard<std::mutex> lk(mutex_);
+        queue_.clear();
+        tsCursor100ns_ = 0;
+    }
+
+    // non-blocking pop
+    bool pop(Chunk &out)
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (queue_.empty())
+            return false;
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        return true;
+    }
+
+private:
+    void run()
+    {
+        // COM init for this thread
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                      IID_PPV_ARGS(&enumerator_));
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        // Default capture endpoint
+        hr = enumerator_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev_);
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        hr = dev_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&audioClient_);
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        // Ask engine for its mix format, but we will request PCM16 48k 2ch (simple)
+        // In shared mode, audio engine typically accepts and does mixing/resampling.
+        WAVEFORMATEX req{};
+        req.wFormatTag = WAVE_FORMAT_PCM;
+        req.nChannels = (WORD)channels_;
+        req.nSamplesPerSec = sampleRate_;
+        req.wBitsPerSample = (WORD)bits_;
+        req.nBlockAlign = (req.nChannels * req.wBitsPerSample) / 8;
+        req.nAvgBytesPerSec = req.nSamplesPerSec * req.nBlockAlign;
+
+        // event-driven
+        const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+        // Use 10ms buffer
+        const REFERENCE_TIME bufferDur = 100000; // 10ms in 100ns
+        hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                      flags,
+                                      bufferDur,
+                                      0,
+                                      &req,
+                                      nullptr);
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event_)
+        {
+            CoUninitialize();
+            return;
+        }
+        hr = audioClient_->SetEventHandle(event_);
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        hr = audioClient_->GetService(IID_PPV_ARGS(&captureClient_));
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        hr = audioClient_->Start();
+        if (FAILED(hr))
+        {
+            CoUninitialize();
+            return;
+        }
+
+        // capture loop
+        while (running_.load())
+        {
+            // wait signal
+            WaitForSingleObject(event_, 50);
+            if (!running_.load())
+                break;
+
+            UINT32 packet = 0;
+            hr = captureClient_->GetNextPacketSize(&packet);
+            if (FAILED(hr))
+                continue;
+
+            while (packet > 0)
+            {
+                BYTE *data = nullptr;
+                UINT32 frames = 0;
+                DWORD flags2 = 0;
+                hr = captureClient_->GetBuffer(&data, &frames, &flags2, nullptr, nullptr);
+                if (FAILED(hr))
+                    break;
+
+                const UINT32 bytesPerFrame = channels_ * (bits_ / 8);
+                const UINT32 bytes = frames * bytesPerFrame;
+
+                Chunk ck;
+                ck.ts100ns = tsCursor100ns_;
+                ck.dur100ns = (LONGLONG)frames * 10'000'000LL / (LONGLONG)sampleRate_;
+                ck.pcm.resize(bytes);
+
+                if (flags2 & AUDCLNT_BUFFERFLAGS_SILENT || !data)
+                {
+                    memset(ck.pcm.data(), 0, bytes);
+                }
+                else
+                {
+                    memcpy(ck.pcm.data(), data, bytes);
+                }
+
+                captureClient_->ReleaseBuffer(frames);
+
+                {
+                    std::lock_guard<std::mutex> lk(mutex_);
+                    // avoid unlimited growth (keep last ~2s)
+                    const size_t maxQueue = (size_t)(sampleRate_ / 480); // ~100 chunks
+                    if (queue_.size() > maxQueue)
+                        queue_.pop_front();
+                    queue_.push_back(std::move(ck));
+                }
+
+                tsCursor100ns_ += (LONGLONG)frames * 10'000'000LL / (LONGLONG)sampleRate_;
+
+                hr = captureClient_->GetNextPacketSize(&packet);
+                if (FAILED(hr))
+                    break;
+            }
+        }
+
+        audioClient_->Stop();
+        CoUninitialize();
+    }
+
+private:
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+    HANDLE event_ = nullptr;
+
+    ComPtr<IMMDeviceEnumerator> enumerator_;
+    ComPtr<IMMDevice> dev_;
+    ComPtr<IAudioClient> audioClient_;
+    ComPtr<IAudioCaptureClient> captureClient_;
+
+    UINT32 sampleRate_ = 48000;
+    UINT32 channels_ = 2;
+    UINT32 bits_ = 16;
+
+    std::mutex mutex_;
+    std::deque<Chunk> queue_;
+    LONGLONG tsCursor100ns_ = 0;
+};
+
 // ---- H.264 / HEVC 錄影器（Media Foundation Sink Writer, 以 NV12 / P010 為輸入）----
 struct WinMFProvider::MfRecorder
 {
     ComPtr<IMFSinkWriter> writer;
     DWORD streamIndex = 0;
+    // ---- Audio (real WASAPI PCM -> AAC) ----
+    DWORD audioStreamIndex = 0;
+    bool hasAudio = false;
+    UINT32 audioSampleRate = 48000;
+    UINT32 audioChannels = 2;
+    UINT32 audioBits = 16; // PCM 16-bit
+
     UINT32 width = 0;
     UINT32 height = 0;
     UINT32 fpsNum = 0;
     UINT32 fpsDen = 1;
     bool isP010 = false;        // false: NV12 → H.264, true: P010 → HEVC
     LONGLONG firstTs100ns = -1; // 第一幀時間當作 0
+
+    WasapiCapture wasapi; // WASAPI capture + queue
+
+    // audio timeline state (relative 100ns, 0-based)
+    LONGLONG lastAudioTs100ns = 0;
 
     void close()
     {
@@ -271,6 +527,107 @@ struct WinMFProvider::MfRecorder
             writer.Reset();
         }
         firstTs100ns = -1;
+        hasAudio = false;
+        lastAudioTs100ns = 0;
+        wasapi.stop();
+    }
+
+    bool writeAudioUpTo(LONGLONG targetRel100ns)
+    {
+        if (!writer || !hasAudio)
+            return true;
+
+        if (targetRel100ns <= 0)
+            return true;
+
+        // 10ms per chunk (simple + stable)
+        const UINT32 samplesPerChunk = audioSampleRate / 100; // 480 @48k
+        const LONGLONG chunkDur100ns = 100000;                // 10ms in 100ns unit
+        const UINT32 bytesPerSample = audioBits / 8;          // 2
+        const DWORD chunkBytes = samplesPerChunk * audioChannels * bytesPerSample;
+
+        // First: drain real WASAPI chunks as much as possible
+        WasapiCapture::Chunk ck;
+        while (wasapi.pop(ck))
+        {
+            // if there is a gap between lastAudioTs100ns and ck.ts100ns, we'll fill later by silence
+            // write real chunk at its timeline position
+            ComPtr<IMFSample> sample;
+            HRESULT hr = MFCreateSample(&sample);
+            if (FAILED(hr))
+                return false;
+
+            ComPtr<IMFMediaBuffer> buf;
+            hr = MFCreateMemoryBuffer((DWORD)ck.pcm.size(), &buf);
+            if (FAILED(hr))
+                return false;
+
+            BYTE *dst = nullptr;
+            DWORD maxLen = 0;
+            hr = buf->Lock(&dst, &maxLen, nullptr);
+            if (FAILED(hr))
+                return false;
+            memcpy(dst, ck.pcm.data(), ck.pcm.size());
+            buf->Unlock();
+            buf->SetCurrentLength((DWORD)ck.pcm.size());
+            hr = sample->AddBuffer(buf.Get());
+            if (FAILED(hr))
+                return false;
+
+            // If audio starts earlier than video timeline (we start from 0), it's fine.
+            sample->SetSampleTime(ck.ts100ns);
+            sample->SetSampleDuration(ck.dur100ns);
+
+            hr = writer->WriteSample(audioStreamIndex, sample.Get());
+            if (FAILED(hr))
+                return false;
+
+            // keep cursor monotonic for silence fill
+            if (ck.ts100ns + ck.dur100ns > lastAudioTs100ns)
+                lastAudioTs100ns = ck.ts100ns + ck.dur100ns;
+        }
+
+        // Then: fill silence if needed until target
+
+        while (lastAudioTs100ns + chunkDur100ns <= targetRel100ns)
+        {
+            ComPtr<IMFSample> sample;
+            HRESULT hr = MFCreateSample(&sample);
+            if (FAILED(hr))
+                return false;
+
+            ComPtr<IMFMediaBuffer> buf;
+            hr = MFCreateMemoryBuffer(chunkBytes, &buf);
+            if (FAILED(hr))
+                return false;
+
+            BYTE *dst = nullptr;
+            DWORD maxLen = 0;
+            hr = buf->Lock(&dst, &maxLen, nullptr);
+            if (FAILED(hr))
+                return false;
+
+            // fill silence
+            memset(dst, 0, chunkBytes);
+
+            buf->Unlock();
+            buf->SetCurrentLength(chunkBytes);
+
+            hr = sample->AddBuffer(buf.Get());
+            if (FAILED(hr))
+                return false;
+
+            sample->SetSampleTime(lastAudioTs100ns);
+            sample->SetSampleDuration(chunkDur100ns);
+
+            hr = writer->WriteSample(audioStreamIndex, sample.Get());
+            if (FAILED(hr))
+                return false;
+
+            lastAudioTs100ns += chunkDur100ns;
+        }
+
+        return true;
     }
 
     bool open(const std::wstring &path, UINT32 w, UINT32 h,
@@ -294,6 +651,9 @@ struct WinMFProvider::MfRecorder
         HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &wtr);
         if (FAILED(hr))
             return false;
+
+        hasAudio = false;
+        lastAudioTs100ns = 0;
 
         // 輸出：H.264 或 HEVC
         GUID outSub = isP010 ? MFVideoFormat_HEVC : MFVideoFormat_H264;
@@ -367,6 +727,98 @@ struct WinMFProvider::MfRecorder
         if (FAILED(hr))
             return false;
 
+        // ------------------------------
+        // Add audio track (AAC out, PCM in) + start WASAPI capture
+        // ------------------------------
+        {
+            ComPtr<IMFMediaType> outAud;
+            ComPtr<IMFMediaType> inAud;
+
+            // Output AAC (encoded)
+            hr = MFCreateMediaType(&outAud);
+            if (FAILED(hr))
+                return false;
+
+            hr = outAud->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            if (FAILED(hr))
+                return false;
+
+            hr = outAud->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            if (FAILED(hr))
+                return false;
+
+            hr = outAud->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audioChannels);
+            if (FAILED(hr))
+                return false;
+
+            hr = outAud->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audioSampleRate);
+            if (FAILED(hr))
+                return false;
+
+            // 128 kbps AAC (common default)
+            const UINT32 aacBitrate = 128000;
+            hr = outAud->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, aacBitrate / 8);
+            if (FAILED(hr))
+                return false;
+
+            // These help some MFTs, harmless if present
+            outAud->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, audioBits);
+
+#ifdef MF_MT_AAC_PAYLOAD_TYPE
+            outAud->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+#endif
+#ifdef MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION
+            // 0x29 is a commonly used value (AAC LC)
+            outAud->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+#endif
+
+            DWORD aidx = 0;
+            hr = wtr->AddStream(outAud.Get(), &aidx);
+            if (FAILED(hr))
+                return false;
+
+            // Input PCM (what we will feed; for Step 3-1 it's silence)
+            hr = MFCreateMediaType(&inAud);
+            if (FAILED(hr))
+                return false;
+
+            hr = inAud->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            if (FAILED(hr))
+                return false;
+
+            hr = inAud->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+            if (FAILED(hr))
+                return false;
+
+            hr = inAud->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audioChannels);
+            if (FAILED(hr))
+                return false;
+
+            hr = inAud->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audioSampleRate);
+            if (FAILED(hr))
+                return false;
+
+            hr = inAud->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, audioBits);
+            if (FAILED(hr))
+                return false;
+
+            const UINT32 blockAlign = audioChannels * (audioBits / 8);
+            const UINT32 avgBytesSec = audioSampleRate * blockAlign;
+            hr = inAud->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, blockAlign);
+            if (FAILED(hr))
+                return false;
+            hr = inAud->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avgBytesSec);
+            if (FAILED(hr))
+                return false;
+
+            hr = wtr->SetInputMediaType(aidx, inAud.Get(), nullptr);
+            if (FAILED(hr))
+                return false;
+
+            audioStreamIndex = aidx;
+            hasAudio = true;
+        }
+
         hr = wtr->BeginWriting();
         if (FAILED(hr))
             return false;
@@ -374,6 +826,11 @@ struct WinMFProvider::MfRecorder
         writer = wtr;
         streamIndex = idx;
         firstTs100ns = -1;
+        lastAudioTs100ns = 0;
+
+        // Start WASAPI capture (default endpoint)
+        // Note: we start from t=0; we'll fill gaps with silence up to video timeline.
+        wasapi.startDefault(audioSampleRate, audioChannels, audioBits);
 
         // ---- Log 實際使用的 Sink Writer 設定 ----
         {
@@ -410,6 +867,16 @@ struct WinMFProvider::MfRecorder
 
         const UINT32 w = width;
         const UINT32 h = height;
+
+        // feed real audio (fallback: silence) to cover this frame end
+        const LONGLONG rtStartPreview = ts100ns - firstTs100ns;
+        const LONGLONG vDuration = 10'000'000LL * fpsDen / fpsNum;
+        if (hasAudio)
+        {
+            // Ensure audio covers at least this frame end time.
+            if (!writeAudioUpTo(rtStartPreview + vDuration))
+                return false;
+        }
 
         const UINT32 rowBytesY = yStrideBytes;
         const UINT32 rowBytesUV = uvStrideBytes;
@@ -462,8 +929,7 @@ struct WinMFProvider::MfRecorder
         LONGLONG rtStart = ts100ns - firstTs100ns;
         sample->SetSampleTime(rtStart);
 
-        LONGLONG duration = 10'000'000LL * fpsDen / fpsNum;
-        sample->SetSampleDuration(duration);
+        sample->SetSampleDuration(vDuration);
 
         hr = writer->WriteSample(streamIndex, sample.Get());
         if (FAILED(hr))
