@@ -150,6 +150,11 @@ extern "C"
     gcap_status_t gcap_start_recording(gcap_handle h, const char *path_utf8);
     gcap_status_t gcap_stop_recording(gcap_handle h);
     gcap_status_t gcap_stop(gcap_handle h);
+    // Enumerate WASAPI capture endpoints (microphones / capture devices)
+    GCAP_API gcap_status_t gcap_enumerate_audio_devices(gcap_audio_device_t *out, int max, int *count);
+    // Select which WASAPI capture endpoint to use for recording.
+    // device_id_utf8 = endpoint id from gcap_enumerate_audio_devices; nullptr/"" => use system default
+    GCAP_API gcap_status_t gcap_set_recording_audio_device(gcap_handle h, const char *device_id_utf8);
     gcap_status_t gcap_close(gcap_handle h);
     GCAP_API void gcap_set_backend(int backend);
     // 選擇要用哪一張 D3D11 Adapter 來做 NV12→RGBA / DXGI 管線

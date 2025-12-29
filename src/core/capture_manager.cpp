@@ -185,6 +185,19 @@ gcap_status_t CaptureManager::stopRecording()
     return GCAP_ENOTSUP;
 }
 
+gcap_status_t CaptureManager::setRecordingAudioDevice(const char *deviceIdUtf8)
+{
+    if (!provider_)
+        return GCAP_ENOTSUP;
+
+#ifdef GCAP_WIN_MF
+    if (auto *p = dynamic_cast<WinMFProvider *>(provider_.get()))
+        return p->setRecordingAudioDevice(deviceIdUtf8);
+#endif
+    (void)deviceIdUtf8;
+    return GCAP_ENOTSUP;
+}
+
 /**
  * @brief Close the current device and release resources.
  */

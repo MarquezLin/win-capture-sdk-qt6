@@ -279,13 +279,14 @@ public:
         std::vector<uint8_t> pcm; // interleaved PCM16
     };
 
-    bool startDefault(UINT32 sampleRate, UINT32 channels, UINT32 bits)
+    bool start(UINT32 sampleRate, UINT32 channels, UINT32 bits, const std::wstring &endpointId)
     {
         stop();
 
         sampleRate_ = sampleRate;
         channels_ = channels;
         bits_ = bits;
+        endpointId_ = endpointId;
 
         running_.store(true);
         thread_ = std::thread([this]()
@@ -345,8 +346,12 @@ private:
             return;
         }
 
-        // Default capture endpoint
-        hr = enumerator_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev_);
+        // Capture endpoint: specified id or default
+        if (!endpointId_.empty())
+            hr = enumerator_->GetDevice(endpointId_.c_str(), &dev_);
+        else
+            hr = enumerator_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev_);
+
         if (FAILED(hr))
         {
             CoUninitialize();
@@ -489,6 +494,7 @@ private:
     UINT32 sampleRate_ = 48000;
     UINT32 channels_ = 2;
     UINT32 bits_ = 16;
+    std::wstring endpointId_;
 
     std::mutex mutex_;
     std::deque<Chunk> queue_;
@@ -631,7 +637,8 @@ struct WinMFProvider::MfRecorder
     }
 
     bool open(const std::wstring &path, UINT32 w, UINT32 h,
-              UINT32 fpsN, UINT32 fpsD, bool p010)
+              UINT32 fpsN, UINT32 fpsD, bool p010,
+              const std::wstring &audioEndpointIdW)
     {
         close();
 
@@ -828,9 +835,9 @@ struct WinMFProvider::MfRecorder
         firstTs100ns = -1;
         lastAudioTs100ns = 0;
 
-        // Start WASAPI capture (default endpoint)
+        // Start WASAPI capture (selected endpoint or default)
         // Note: we start from t=0; we'll fill gaps with silence up to video timeline.
-        wasapi.startDefault(audioSampleRate, audioChannels, audioBits);
+        wasapi.start(audioSampleRate, audioChannels, audioBits, audioEndpointIdW);
 
         // ---- Log 實際使用的 Sink Writer 設定 ----
         {
@@ -997,7 +1004,12 @@ gcap_status_t WinMFProvider::startRecording(const char *pathUtf8)
     UINT32 fpsD = profile_.fps_den ? profile_.fps_den : 1;
 
     std::wstring wpath = utf8_to_wstring(pathUtf8);
-    if (!recorder_->open(wpath, w, h, fpsN, fpsD, isP010Format))
+    // recording audio endpoint (empty => default)
+    std::wstring audioIdW;
+    if (!rec_audio_device_id_.empty())
+        audioIdW = utf8_to_wstring(rec_audio_device_id_.c_str());
+
+    if (!recorder_->open(wpath, w, h, fpsN, fpsD, isP010Format, audioIdW))
         return GCAP_EIO;
 
     OutputDebugStringA("[WinMF] Recorder: startRecording()\\n");
@@ -1013,6 +1025,19 @@ gcap_status_t WinMFProvider::stopRecording()
         recorder_->close();
         OutputDebugStringA("[WinMF] Recorder: stopRecording()\\n");
     }
+    return GCAP_OK;
+}
+
+gcap_status_t WinMFProvider::setRecordingAudioDevice(const char *device_id_utf8)
+{
+    std::lock_guard<std::mutex> lock(recorderMutex_);
+
+    // Only affects next startRecording call.
+    rec_audio_device_id_.clear();
+    if (device_id_utf8 && *device_id_utf8)
+        rec_audio_device_id_ = device_id_utf8;
+
+    OutputDebugStringA("[WinMF] Recorder audio endpoint set\n");
     return GCAP_OK;
 }
 

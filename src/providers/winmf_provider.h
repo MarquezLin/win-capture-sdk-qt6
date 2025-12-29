@@ -49,6 +49,10 @@ public:
     gcap_status_t startRecording(const char *pathUtf8);
     gcap_status_t stopRecording();
 
+    // Select WASAPI capture endpoint for recording audio.
+    // device_id_utf8 from gcap_enumerate_audio_devices; nullptr/"" => use default endpoint.
+    gcap_status_t setRecordingAudioDevice(const char *device_id_utf8);
+
     // Set number of buffers and size hints (unused here)
     bool setBuffers(int count, size_t bytes_hint) override;
 
@@ -192,6 +196,8 @@ private:
     struct MfRecorder;
     std::unique_ptr<MfRecorder> recorder_;
     std::mutex recorderMutex_;
+    // Recording audio endpoint id (WASAPI endpoint id, UTF-8). Empty => system default.
+    std::string rec_audio_device_id_;
 
     std::vector<uint8_t> cpu_argb_;
 

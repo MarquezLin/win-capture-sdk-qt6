@@ -107,6 +107,7 @@ public:
     gcap_status_t start();
     gcap_status_t startRecording(const char *pathUtf8);
     gcap_status_t stopRecording();
+    gcap_status_t setRecordingAudioDevice(const char *deviceIdUtf8);
     gcap_status_t stop();
     gcap_status_t close();
     gcap_status_t getDeviceProps(gcap_device_props_t &out);

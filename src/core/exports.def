@@ -8,6 +8,8 @@ EXPORTS
     gcap_start
     gcap_start_recording
     gcap_stop_recording
+    gcap_enumerate_audio_devices
+    gcap_set_recording_audio_device
     gcap_set_backend
     gcap_set_d3d_adapter
     gcap_get_device_props

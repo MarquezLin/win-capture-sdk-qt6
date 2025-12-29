@@ -27,6 +27,7 @@ extern "C"
         int sample_rate;     // 44100, 48000...
         int bits_per_sample; // 16 / 24 / 32
         int is_float;        // 1 = IEEE float, 0 = PCM
+        int is_default;
     } gcap_audio_device_t;
 
     // number of active capture audio devices
