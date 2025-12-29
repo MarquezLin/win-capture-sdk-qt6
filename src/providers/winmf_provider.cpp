@@ -282,6 +282,9 @@ public:
     bool start(UINT32 sampleRate, UINT32 channels, UINT32 bits, const std::wstring &endpointId)
     {
         stop();
+        // Reset device-position timeline base for each start
+        haveBasePos_ = false;
+        basePos_ = 0;
 
         sampleRate_ = sampleRate;
         channels_ = channels;
@@ -346,11 +349,20 @@ private:
             return;
         }
 
-        // Capture endpoint: specified id or default
+        // Use selected endpoint if provided; otherwise fall back to default.
         if (!endpointId_.empty())
+        {
             hr = enumerator_->GetDevice(endpointId_.c_str(), &dev_);
+            if (FAILED(hr))
+            {
+                // Device may have been removed / id invalid → fallback to default.
+                hr = enumerator_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev_);
+            }
+        }
         else
+        {
             hr = enumerator_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev_);
+        }
 
         if (FAILED(hr))
         {
@@ -379,7 +391,7 @@ private:
         const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
         // Use 10ms buffer
-        const REFERENCE_TIME bufferDur = 100000; // 10ms in 100ns
+        const REFERENCE_TIME bufferDur = 300000; // 30ms in 100ns
         hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                       flags,
                                       bufferDur,
@@ -423,7 +435,7 @@ private:
         while (running_.load())
         {
             // wait signal
-            WaitForSingleObject(event_, 50);
+            WaitForSingleObject(event_, 20);
             if (!running_.load())
                 break;
 
@@ -437,15 +449,26 @@ private:
                 BYTE *data = nullptr;
                 UINT32 frames = 0;
                 DWORD flags2 = 0;
-                hr = captureClient_->GetBuffer(&data, &frames, &flags2, nullptr, nullptr);
+                UINT64 devPos = 0; // in frames
+                UINT64 qpcPos = 0; // QPC ticks
+                hr = captureClient_->GetBuffer(&data, &frames, &flags2, &devPos, &qpcPos);
                 if (FAILED(hr))
                     break;
+                // Use device position to build an accurate timeline even if discontinuities happen.
+                // devPos is the position (in frames) of the first frame in this packet since stream start.
+                if (!haveBasePos_)
+                {
+                    basePos_ = devPos;
+                    haveBasePos_ = true;
+                }
 
                 const UINT32 bytesPerFrame = channels_ * (bits_ / 8);
                 const UINT32 bytes = frames * bytesPerFrame;
 
                 Chunk ck;
-                ck.ts100ns = tsCursor100ns_;
+                // Timestamp derived from device position, not local cursor.
+                const UINT64 relFrames = (devPos >= basePos_) ? (devPos - basePos_) : 0;
+                ck.ts100ns = (LONGLONG)relFrames * 10'000'000LL / (LONGLONG)sampleRate_;
                 ck.dur100ns = (LONGLONG)frames * 10'000'000LL / (LONGLONG)sampleRate_;
                 ck.pcm.resize(bytes);
 
@@ -469,7 +492,8 @@ private:
                     queue_.push_back(std::move(ck));
                 }
 
-                tsCursor100ns_ += (LONGLONG)frames * 10'000'000LL / (LONGLONG)sampleRate_;
+                // Keep cursor for debug only; real timestamp uses devPos.
+                tsCursor100ns_ = ck.ts100ns + ck.dur100ns;
 
                 hr = captureClient_->GetNextPacketSize(&packet);
                 if (FAILED(hr))
@@ -495,6 +519,9 @@ private:
     UINT32 channels_ = 2;
     UINT32 bits_ = 16;
     std::wstring endpointId_;
+    // Device-position timeline base (reset each start)
+    bool haveBasePos_ = false;
+    UINT64 basePos_ = 0;
 
     std::mutex mutex_;
     std::deque<Chunk> queue_;
@@ -549,13 +576,60 @@ struct WinMFProvider::MfRecorder
         // 10ms per chunk (simple + stable)
         const UINT32 samplesPerChunk = audioSampleRate / 100; // 480 @48k
         const LONGLONG chunkDur100ns = 100000;                // 10ms in 100ns unit
-        const UINT32 bytesPerSample = audioBits / 8;          // 2
+        // Allow audio to be slightly behind video to avoid repeatedly injecting tiny silence gaps
+        // that later "real" audio would have covered.
+        const LONGLONG slack100ns = 50000;           // 5ms
+        const UINT32 bytesPerSample = audioBits / 8; // 2
         const DWORD chunkBytes = samplesPerChunk * audioChannels * bytesPerSample;
 
         // First: drain real WASAPI chunks as much as possible
         WasapiCapture::Chunk ck;
         while (wasapi.pop(ck))
         {
+            // If there is a gap between lastAudioTs100ns and the next real audio chunk,
+            // fill it with silence so the timeline stays continuous.
+            if (ck.ts100ns > lastAudioTs100ns)
+            {
+                const UINT32 samplesPerChunk = audioSampleRate / 100; // 10ms
+                const LONGLONG chunkDur100ns = 100000;                // 10ms
+                const UINT32 bytesPerSample = audioBits / 8;
+                const DWORD chunkBytes = samplesPerChunk * audioChannels * bytesPerSample;
+
+                while (lastAudioTs100ns + chunkDur100ns <= ck.ts100ns)
+                {
+                    ComPtr<IMFSample> s;
+                    HRESULT hr = MFCreateSample(&s);
+                    if (FAILED(hr))
+                        return false;
+                    ComPtr<IMFMediaBuffer> b;
+                    hr = MFCreateMemoryBuffer(chunkBytes, &b);
+                    if (FAILED(hr))
+                        return false;
+
+                    BYTE *dst = nullptr;
+                    DWORD maxLen = 0;
+                    hr = b->Lock(&dst, &maxLen, nullptr);
+                    if (FAILED(hr))
+                        return false;
+                    memset(dst, 0, chunkBytes);
+                    b->Unlock();
+                    b->SetCurrentLength(chunkBytes);
+
+                    hr = s->AddBuffer(b.Get());
+                    if (FAILED(hr))
+                        return false;
+                    s->SetSampleTime(lastAudioTs100ns);
+                    s->SetSampleDuration(chunkDur100ns);
+                    hr = writer->WriteSample(audioStreamIndex, s.Get());
+                    if (FAILED(hr))
+                        return false;
+                    lastAudioTs100ns += chunkDur100ns;
+                }
+            }
+            // If we already advanced the audio timeline past this chunk (e.g., due to silence fill),
+            // writing it would create overlapping / out-of-order timestamps and audible glitches.
+            if (ck.ts100ns + ck.dur100ns <= lastAudioTs100ns)
+                continue;
             // if there is a gap between lastAudioTs100ns and ck.ts100ns, we'll fill later by silence
             // write real chunk at its timeline position
             ComPtr<IMFSample> sample;
@@ -593,9 +667,9 @@ struct WinMFProvider::MfRecorder
                 lastAudioTs100ns = ck.ts100ns + ck.dur100ns;
         }
 
-        // Then: fill silence if needed until target
-
-        while (lastAudioTs100ns + chunkDur100ns <= targetRel100ns)
+        // Then: fill silence if needed until target (with small slack)
+        const LONGLONG targetWithSlack = (targetRel100ns > slack100ns) ? (targetRel100ns - slack100ns) : 0;
+        while (lastAudioTs100ns + chunkDur100ns <= targetWithSlack)
         {
             ComPtr<IMFSample> sample;
             HRESULT hr = MFCreateSample(&sample);
