@@ -12,6 +12,7 @@ add_library(gcapture SHARED
     src/core/frame_converter.cpp
     src/core/c_api.cpp
     src/providers/winmf_provider.cpp
+    src/providers/mf_recorder.cpp
     src/providers/dshow_provider.cpp 
     src/audio/audio_manager.cpp
     src/core/exports.def
